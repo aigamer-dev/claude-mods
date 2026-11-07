@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { EgmRun, Task, Usage } from '../types'
 import {
-  bar,
+  barParts,
   blank,
   correction,
   estTaskMin,
@@ -274,18 +274,36 @@ export const register: Register = on => {
     const doneCount = t.filter(x => x.status === 'completed').length
     const icon = (s: Task['status']) => (s === 'completed' ? '✔' : s === 'in_progress' ? '▶' : '○')
     const left = expectedAgents(g, S.model)
+    const hasWork = f.pending > 0 || (g && !g.doneAt)
+    const five = barParts(u.fiveHour?.pct ?? 0, hasWork ? f.pctNeeded : 0)
+    const wk = barParts(u.week?.pct ?? 0, 0)
 
     return (
       <Box flexDirection="column">
         <Text bold>Limits</Text>
-        <Text>
-          5h   {bar(u.fiveHour?.pct ?? 0)} {u.fiveHour ? `${u.fiveHour.pct.toFixed(0)}%` : '--'}
-          {reset(u.fiveHour)}
-        </Text>
-        <Text>
-          Week {bar(u.week?.pct ?? 0)} {u.week ? `${u.week.pct.toFixed(0)}%` : '--'}
-          {reset(u.week)}
-        </Text>
+        <Box flexDirection="row">
+          <Text>5h   </Text>
+          <Text color="red">{'█'.repeat(five.used)}</Text>
+          <Text color="white">{'█'.repeat(five.est)}</Text>
+          <Text dimColor>{'░'.repeat(five.free)}</Text>
+          <Text>
+            {' '}
+            {u.fiveHour ? `${u.fiveHour.pct.toFixed(0)}%` : '--'}
+            {f.pending > 0 || (g && !g.doneAt) ? ` +${f.pctNeeded.toFixed(0)}% est` : ''}
+            {reset(u.fiveHour)}
+          </Text>
+        </Box>
+        <Box flexDirection="row">
+          <Text>Week </Text>
+          <Text color="red">{'█'.repeat(wk.used)}</Text>
+          <Text dimColor>{'░'.repeat(wk.free)}</Text>
+          <Text>
+            {' '}
+            {u.week ? `${u.week.pct.toFixed(0)}%` : '--'}
+            {reset(u.week)}
+          </Text>
+        </Box>
+        <Text dimColor>red used · white estimated for the tasks left · dim unused</Text>
         <Text dimColor>
           Session: {fmtTok(u.tokens)} effective tokens · ${u.usd.toFixed(2)}
         </Text>

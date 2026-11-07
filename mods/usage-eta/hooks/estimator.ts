@@ -328,3 +328,12 @@ export function applyTool(
   }
   return [...list]
 }
+
+/** Cells of a limit bar: used (red), the forecast's share (white), the rest. */
+export function barParts(used: number, est: number, width = 16) {
+  const u = clamp(used, 0, 100)
+  const w = clamp(est, 0, 100 - u)
+  const usedCells = Math.round((u / 100) * width)
+  const estCells = Math.min(width - usedCells, Math.round(((u + w) / 100) * width) - usedCells)
+  return { used: usedCells, est: Math.max(0, estCells), free: width - usedCells - Math.max(0, estCells) }
+}
