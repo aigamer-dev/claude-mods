@@ -1,0 +1,6 @@
+{
+  "name": "usage-eta",
+  "version": "0.1.0",
+  "description": "Session and weekly usage, task tracker with EGM steps, and a self-calibrating ETA, token and fits-in-5h estimator.",
+  "types": "./types/index.d.ts"
+}
