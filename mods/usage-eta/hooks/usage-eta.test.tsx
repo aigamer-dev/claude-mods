@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { blank, correction, forecast, learnTask, splitEta } from './estimator'
+import { applyTool, blank, correction, forecast, learnTask, splitEta, syncTodos } from './estimator'
 
 const PANE = {
   plugin: 'usage-eta',
@@ -51,5 +51,53 @@ test('the pane draws limits, tasks and the forecast', async ($, on) => {
   on('clock.now', () => ({ value: 1_700_000_000_000 }))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /No todo list yet/ }))?.text).toBe('No todo list yet.')
+  await ui.unmount()
+})
+
+test('TaskCreate and TaskUpdate build and advance a list', () => {
+  let l = applyTool([], 'TaskCreate', { subject: 'Parse (~5m)' }, 'Task #1 created successfully')
+  l = applyTool(l, 'TaskCreate', { subject: 'Test (~3m)' }, 'Task #2 created successfully')
+  l = applyTool(l, 'TaskUpdate', { taskId: '1', status: 'in_progress' })
+  l = applyTool(l, 'TaskUpdate', { taskId: '1', status: 'completed' })
+  l = applyTool(l, 'TaskUpdate', { taskId: '2', status: 'deleted' })
+  expect(l.map(t => t.status)).toEqual(['completed'])
+})
+
+test('update_plan items and advance are followed', () => {
+  let l = applyTool([], 'mcp__ccd_turn__update_plan', {
+    items: [
+      { content: 'A (~2m)', status: 'in_progress' },
+      { content: 'B', status: 'pending' },
+    ],
+  })
+  l = applyTool(l, 'mcp__ccd_turn__update_plan', { advance: true })
+  expect(l.map(t => t.status)).toEqual(['completed', 'in_progress'])
+})
+
+test('a finished task is learned from, once', () => {
+  const base = { t: 0, tok: 0 }
+  const first = syncTodos([], [{ content: 'A (~2m)', status: 'in_progress' }], 1000, 0, base)
+  const second = syncTodos(first.tasks, [{ content: 'A (~2m)', status: 'completed' }], 61000, 5000, base)
+  expect(second.done).toHaveLength(1)
+  const again = syncTodos(second.tasks, [{ content: 'A (~2m)', status: 'completed' }], 70000, 5000, base)
+  expect(again.done).toHaveLength(0)
+})
+
+test('a TaskCreate call reaches the pane through the hooks', async ($, on) => {
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('clock.now', () => ({ value: 1_700_000_000_000 }))
+  on('session.messages', () => ({ value: [] }))
+  on('command.register', () => ({ value: { command: 'eta' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.invalidate', () => ({ value: undefined }))
+  on('clock.every', () => ({ value: () => {} }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.call', () => ({ result: {}, text: 'Task #1 created successfully' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'TaskCreate', subject: 'Write parser (~4m)', description: 'x' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Write parser/ }))?.text).toMatch(/Write parser/)
   await ui.unmount()
 })

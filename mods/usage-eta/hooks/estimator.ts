@@ -77,8 +77,10 @@ export function learnTask(
 }
 
 export function learnRate(m: Model, deltaPct: number, tokens: number): Model {
-  if (deltaPct <= 0 || tokens <= 2000) return m
-  const x = clamp(deltaPct / (tokens / 1e6), 0.1, 500)
+  // Other sessions on the account also spend the limit, so a tiny token count
+  // against a whole percent is noise: wait for a real sample.
+  if (deltaPct <= 0 || tokens < 20000) return m
+  const x = clamp(deltaPct / (tokens / 1e6), 0.3, 60)
   return { ...m, pctPerMtok: ewma(m.pctPerMtok, x, m.nRate), nRate: m.nRate + 1 }
 }
 
@@ -111,7 +113,7 @@ export function splitEta(content: string): { text: string; eta?: number } {
   return { text: content.slice(0, hit.index).trim(), eta: Number(hit[1]) * unit }
 }
 
-export type Todo = { content: string; status: Task['status'] }
+export type Todo = { content: string; status: Task['status']; key?: string }
 
 export function syncTodos(
   prev: readonly Task[],
@@ -261,4 +263,68 @@ export function fmtTok(n: number): string {
 export function bar(pct: number, width = 16): string {
   const f = Math.round((clamp(pct, 0, 100) / 100) * width)
   return '█'.repeat(f) + '░'.repeat(width - f)
+}
+
+export const TRACKED = new Set([
+  'TodoWrite',
+  'TaskCreate',
+  'TaskUpdate',
+  'mcp__ccd_turn__update_plan',
+])
+
+const STATUSES = new Set(['pending', 'in_progress', 'completed'])
+const asStatus = (s: unknown): Task['status'] =>
+  typeof s === 'string' && STATUSES.has(s) ? (s as Task['status']) : 'pending'
+
+/**
+ * Applies one task-tool call to a todo list. Handles the CLI's TodoWrite and
+ * TaskCreate/TaskUpdate and the desktop app's update_plan; `text` is the tool's
+ * result, which names a created task's id.
+ */
+export function applyTool(
+  list: readonly Todo[],
+  tool: string,
+  input: Record<string, unknown>,
+  text?: string,
+): Todo[] {
+  if (tool === 'TodoWrite') {
+    const todos = (input.todos as { content?: string; status?: string }[] | undefined) ?? []
+    return todos.map(t => ({ content: String(t.content ?? ''), status: asStatus(t.status) }))
+  }
+  if (tool === 'TaskCreate') {
+    const id = /#(\d+)/.exec(text ?? '')?.[1] ?? String(list.length + 1)
+    return [...list, { content: String(input.subject ?? ''), status: 'pending', key: id }]
+  }
+  if (tool === 'TaskUpdate') {
+    const id = String(input.taskId ?? '')
+    if (input.status === 'deleted') return list.filter(t => t.key !== id)
+    return list.map(t =>
+      t.key === id
+        ? {
+            ...t,
+            content: typeof input.subject === 'string' ? input.subject : t.content,
+            status: input.status === undefined ? t.status : asStatus(input.status),
+          }
+        : t,
+    )
+  }
+  if (tool === 'mcp__ccd_turn__update_plan') {
+    let out = list.map(t => ({ ...t }))
+    const items = input.items as { content?: string; status?: string }[] | undefined
+    if (items) out = items.map(t => ({ content: String(t.content ?? ''), status: asStatus(t.status) }))
+    if (input.advance) {
+      const i = out.findIndex(t => t.status === 'in_progress')
+      if (i >= 0) out[i] = { ...out[i], status: 'completed' }
+      const j = out.findIndex(t => t.status === 'pending')
+      if (j >= 0) out[j] = { ...out[j], status: 'in_progress' }
+    }
+    for (const n of (input.done as number[] | undefined) ?? []) {
+      if (out[n - 1]) out[n - 1] = { ...out[n - 1], status: 'completed' }
+    }
+    if (typeof input.start === 'number' && out[input.start - 1]) {
+      out[input.start - 1] = { ...out[input.start - 1], status: 'in_progress' }
+    }
+    return out
+  }
+  return [...list]
 }

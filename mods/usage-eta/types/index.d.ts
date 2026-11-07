@@ -10,6 +10,8 @@ export type Task = {
 }
 
 export type EgmStep = {
+  /** The tool_use_id of the Agent call, so two hooks never log one step twice. */
+  id: string
   type: string
   label: string
   startedAt: number

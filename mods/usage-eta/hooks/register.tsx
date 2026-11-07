@@ -15,7 +15,10 @@ import {
   learnRate,
   learnTask,
   syncTodos,
+  applyTool,
+  TRACKED,
 } from './estimator'
+import type { Todo } from './estimator'
 import type { Model } from './estimator'
 
 const PANE = 'usage-eta'
@@ -23,7 +26,7 @@ const tasks = atom({ plugin: 'usage-eta', key: 'tasks' } as const, [], {
   shape: 'tasks-1',
 })
 const egm = atom({ plugin: 'usage-eta', key: 'egm' } as const, null, {
-  shape: 'egm-1',
+  shape: 'egm-2',
 })
 const usage = atom({ plugin: 'usage-eta', key: 'usage' } as const, { tokens: 0, usd: 0 }, {
   shape: 'usage-1',
@@ -33,10 +36,11 @@ const ETA_RULE = {
   id: 'usage-eta:eta',
   scope: 'session',
   text:
-    'When you keep a todo list (TodoWrite), end every item\'s content with your honest time ' +
-    'estimate in minutes, like "Write the parser (~12m)" or "(~1.5h)". The usage tracker ' +
-    'compares it with the real time and calibrates future estimates. Keep item wording ' +
-    'unchanged between updates so progress is matched.',
+    'When you keep a task list (TodoWrite, TaskCreate, or a plan tool), end every item\'s ' +
+    'text (the todo content, task subject or plan step) with your honest time estimate in ' +
+    'minutes, like "Write the parser (~12m)" or "(~1.5h)". The usage tracker compares it ' +
+    'with the real time and calibrates future estimates. Keep item wording unchanged ' +
+    'between updates so progress is matched.',
 } as const
 
 const effective = (u: {
@@ -55,6 +59,7 @@ const S = {
   mark: { t: 0, tok: 0 },
   tokSincePct: 0,
   lastPct: undefined as number | undefined,
+  todos: [] as Todo[],
 }
 
 async function save($: EngineInterface) {
@@ -84,10 +89,73 @@ async function refreshStatus($: EngineInterface) {
   $.ui.status(await summary($))
 }
 
+/** Feeds a todo snapshot to the tracker; learns from tasks that just finished. */
+async function ingest($: EngineInterface, todos: readonly Todo[]) {
+  await ensure($)
+  const now = await $.clock.now()
+  const u = await read($, usage)
+  const prev = await read($, tasks)
+  const { tasks: nextTasks, done } = syncTodos(prev, todos, now, u.tokens, S.mark)
+  await update($, tasks, () => nextTasks)
+  for (const t of done) {
+    S.model = learnTask(S.model, {
+      eta: t.eta,
+      actualMin: ((t.doneAt ?? now) - (t.startedAt ?? now)) / 60000,
+      tokens: u.tokens - (t.tokStart ?? u.tokens),
+    })
+  }
+  if (done.length > 0) await save($)
+  S.mark = { t: now, tok: u.tokens }
+}
+
+/**
+ * Rebuilds the todo list from the transcript. It does not depend on this
+ * plugin's tool.call hook running, so a plugin above that answers a task tool
+ * by itself, or a call this hook never saw, still reaches the tracker.
+ */
+async function replay($: EngineInterface): Promise<Todo[]> {
+  const rows = await $.session.messages()
+  let list: Todo[] = []
+  for (const m of rows) {
+    for (const use of m.toolUses) {
+      if (TRACKED.has(use.tool) && use.isError !== true) {
+        list = applyTool(list, use.tool, use.input, use.text)
+      }
+    }
+  }
+  return list
+}
+
+async function reconcile($: EngineInterface) {
+  const list = await replay($)
+  if (list.length > 0) {
+    S.todos = list
+    await ingest($, list)
+  }
+}
+
+async function startStep($: EngineInterface, id: string, type: string, label: string) {
+  const run = await read($, egm)
+  if (!run || run.doneAt || run.steps.some(s => s.id === id)) return false
+  const step = { id, type, label, startedAt: await $.clock.now() }
+  await update($, egm, r => (r ? { ...r, steps: [...r.steps, step] } : r))
+  return true
+}
+
+async function endStep($: EngineInterface, id: string) {
+  const end = await $.clock.now()
+  await update($, egm, r =>
+    r
+      ? { ...r, steps: r.steps.map(s => (s.id === id && !s.doneAt ? { ...s, doneAt: end } : s)) }
+      : r,
+  )
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await ensure($)
     S.mark = { t: await $.clock.now(), tok: 0 }
+    S.todos = []
     await $.command.register({ name: 'eta', description: 'Show usage limits, tasks and the ETA estimator' })
     void $.ui.open({ id: PANE, title: 'Usage & ETA' })
     $.clock.every(30000, () => $.ui.invalidate('ui.render'))
@@ -109,25 +177,26 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
-    await ensure($)
-    const now = await $.clock.now()
-    const u = await read($, usage)
-    const prev = await read($, tasks)
-    const todos = e.todos.map(t => ({ content: t.content, status: t.status }))
-    const { tasks: nextTasks, done } = syncTodos(prev, todos, now, u.tokens, S.mark)
-    await update($, tasks, () => nextTasks)
-    for (const t of done) {
-      S.model = learnTask(S.model, {
-        eta: t.eta,
-        actualMin: ((t.doneAt ?? now) - (t.startedAt ?? now)) / 60000,
-        tokens: u.tokens - (t.tokStart ?? u.tokens),
-      })
+  on('tool.call', async ($, e, next) => {
+    const tool = String(e.tool)
+    if (tool === 'Agent') {
+      const input = e as unknown as { subagent_type?: string; description?: string }
+      const id = e.tool_use_id ?? ''
+      const isNew =
+        id !== '' &&
+        (await startStep($, id, input.subagent_type ?? 'general-purpose', input.description ?? ''))
+      const ran = await next(e)
+      if (isNew) await endStep($, id)
+      return ran
     }
-    if (done.length > 0) await save($)
-    S.mark = { t: now, tok: u.tokens }
+    if (!TRACKED.has(tool)) return next(e)
     const ran = await next(e)
-    await refreshStatus($)
+    if (ran.deny === undefined && ran.isError !== true) {
+      if (S.todos.length === 0) S.todos = await replay($)
+      S.todos = applyTool(S.todos, tool, e as unknown as Record<string, unknown>, ran.text)
+      await ingest($, S.todos)
+      await refreshStatus($)
+    }
     return ran
   })
 
@@ -142,24 +211,10 @@ export const register: Register = on => {
   })
 
   on('agent.spawn', async ($, e, next) => {
-    const run = await read($, egm)
-    if (!run || run.doneAt) return next(e)
-    const step = { type: e.subagentType, label: e.description, startedAt: await $.clock.now() }
-    await update($, egm, r => (r ? { ...r, steps: [...r.steps, step] } : r))
+    const isNew =
+      e.tool_use_id !== '' && (await startStep($, e.tool_use_id, e.subagentType, e.description))
     const ran = await next(e)
-    const end = await $.clock.now()
-    await update($, egm, r =>
-      r
-        ? {
-            ...r,
-            steps: r.steps.map(s =>
-              s.startedAt === step.startedAt && s.type === step.type && !s.doneAt
-                ? { ...s, doneAt: end }
-                : s,
-            ),
-          }
-        : r,
-    )
+    if (isNew) await endStep($, e.tool_use_id)
     return ran
   })
 
@@ -179,6 +234,7 @@ export const register: Register = on => {
       S.model = learnEgm(S.model, finished, now)
       await save($)
     }
+    if (isMain) await reconcile($)
     await refreshStatus($)
     return r
   })
