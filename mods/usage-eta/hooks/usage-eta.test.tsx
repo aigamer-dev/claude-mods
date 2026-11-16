@@ -101,3 +101,20 @@ test('a TaskCreate call reaches the pane through the hooks', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /Write parser/ }))?.text).toMatch(/Write parser/)
   await ui.unmount()
 })
+
+import { COLD_MIN, planResume, shouldTrigger } from './guard'
+
+test('the guard trips only at 95% used with an estimate over 98%', () => {
+  expect(shouldTrigger(96, 5)).toBe(true)
+  expect(shouldTrigger(96, 1)).toBe(false) // 97% total: still fits
+  expect(shouldTrigger(90, 20)).toBe(false) // not yet at 95%
+  expect(shouldTrigger(undefined, 50)).toBe(false)
+})
+
+test('a wait past 40 minutes clears the session, a short one keeps it', () => {
+  const now = 1_700_000_000_000
+  const at = (min: number) => new Date(now + min * 60000).toISOString()
+  expect(planResume(now, at(COLD_MIN + 1)).clear).toBe(true)
+  expect(planResume(now, at(COLD_MIN - 1)).clear).toBe(false)
+  expect(planResume(now, at(10)).resumeAt).toBeGreaterThan(now + 10 * 60000)
+})

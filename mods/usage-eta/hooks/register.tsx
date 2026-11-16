@@ -19,6 +19,17 @@ import {
   TRACKED,
 } from './estimator'
 import type { Todo } from './estimator'
+import {
+  MARKER,
+  aarPath,
+  aarPrompt,
+  planResume,
+  purgeScript,
+  resumePrompt,
+  shouldTrigger,
+  storeKey,
+} from './guard'
+import type { Pending, Phase } from './guard'
 import type { Model } from './estimator'
 
 const PANE = 'usage-eta'
@@ -52,6 +63,20 @@ const effective = (u: {
   u.input_tokens + u.output_tokens + u.cache_creation_input_tokens + 0.1 * u.cache_read_input_tokens
 
 const skillName = (s: string) => s.replace(/^egm:/, '')
+
+/** Limit-guard state: idle, writing the AAR, or waiting for the reset. */
+const G = {
+  phase: 'idle' as Phase,
+  /** The main loop's running turn, so the guard can stop it. */
+  turnId: undefined as string | undefined,
+  /** True once the AAR turn this guard asked for has started. */
+  armed: false,
+  aar: '',
+  used: 0,
+  est: 0,
+  resetsAt: undefined as string | undefined,
+  pending: undefined as Pending | undefined,
+}
 
 const S = {
   model: blank() as Model,
@@ -151,6 +176,83 @@ async function endStep($: EngineInterface, id: string) {
   )
 }
 
+/** Trips the guard: stop the running turn and ask for the AAR. */
+async function maybeTrigger($: EngineInterface) {
+  if (G.phase !== 'idle') return
+  const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
+  const now = await $.clock.now()
+  const f = forecast(t, g, u, S.model, now)
+  const used = u.fiveHour?.pct
+  if (!shouldTrigger(used, f.pctNeeded) || used === undefined) return
+  G.phase = 'writing'
+  G.armed = false
+  G.used = used
+  G.est = used + f.pctNeeded
+  G.resetsAt = u.fiveHour?.resetsAt
+  const cwd = await $.session.cwd()
+  G.aar = aarPath(cwd, now)
+  const resetIn = fmtMin(f.minsToReset ?? 300)
+  $.ui.toast(`5h limit ${used.toFixed(0)}% (est ${G.est.toFixed(0)}%): writing the AAR, then pausing until the reset`)
+  if (G.turnId) await $.turn.abort({ turnId: G.turnId } as never).catch(() => undefined)
+  void $.prompt.submit({ text: aarPrompt(G.aar, used, G.est, resetIn) }).catch(() => {
+    G.phase = 'idle'
+  })
+}
+
+/** The AAR turn is done: decide between clearing and keeping the session, arm the resume. */
+async function finishAar($: EngineInterface) {
+  const now = await $.clock.now()
+  const cwd = await $.session.cwd()
+  const wrote = await $.fs.exists(G.aar).catch(() => false)
+  if (!wrote) {
+    G.phase = 'idle'
+    $.ui.toast('AAR was not written; the limit guard is off until the next trip')
+    return
+  }
+  const plan = planResume(now, G.resetsAt)
+  const pending: Pending = {
+    aar: G.aar,
+    cwd,
+    resumeAt: plan.resumeAt,
+    cleared: plan.clear,
+    oldSession: await $.session.id(),
+  }
+  G.pending = pending
+  G.phase = 'waiting'
+  await $.store.set(storeKey(cwd), pending)
+  $.ui.toast(
+    plan.clear
+      ? `AAR saved. Reset in ${fmtMin(plan.waitMin)} (cache will be cold): clearing, resuming from the AAR`
+      : `AAR saved. Reset in ${fmtMin(plan.waitMin)}: resuming in this session`,
+  )
+  if (plan.clear) {
+    $.clock.after(2000, () => {
+      void $.command.run({ command: 'clear' }).catch(() => {
+        // Could not clear: resume in this session instead.
+        if (G.pending) G.pending = { ...G.pending, cleared: false }
+      })
+    })
+  }
+}
+
+/** Fires the resume when the reset has passed; purges the superseded session. */
+async function checkResume($: EngineInterface) {
+  if (G.phase !== 'waiting' || !G.pending) return
+  const now = await $.clock.now()
+  const p = G.pending
+  if (now < p.resumeAt) return
+  G.phase = 'idle'
+  G.pending = undefined
+  await $.store.delete(storeKey(p.cwd))
+  void $.prompt.submit({ text: resumePrompt(p.aar, p.cleared) }).catch(() => undefined)
+  if (p.cleared && p.oldSession) {
+    // Old sessions are moved to ~/archive/_review/<date>/ (manifest), never deleted outright.
+    void $.process
+      .run(['sh', '-c', purgeScript, 'sh', p.oldSession, p.aar], { timeoutMs: 20000 })
+      .catch(() => undefined)
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await ensure($)
@@ -158,7 +260,25 @@ export const register: Register = on => {
     S.todos = []
     await $.command.register({ name: 'eta', description: 'Show usage limits, tasks and the ETA estimator' })
     void $.ui.open({ id: PANE, title: 'Usage & ETA' })
-    $.clock.every(30000, () => $.ui.invalidate('ui.render'))
+    $.clock.every(30000, () => {
+      $.ui.invalidate('ui.render')
+      void checkResume($)
+    })
+    // A restart while waiting for the reset: pick the pending resume back up.
+    const saved = (await $.store.get(storeKey(await $.session.cwd()))) as Pending | undefined
+    if (saved?.aar && G.phase === 'idle') {
+      G.pending = { ...saved, cleared: true, oldSession: saved.oldSession }
+      G.phase = 'waiting'
+    }
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const agentId = (e as { agentId?: string }).agentId
+    if (!agentId) {
+      G.turnId = e.turnId
+      if (G.phase === 'writing' && e.text.includes(MARKER)) G.armed = true
+    }
     return next(e)
   })
 
@@ -236,6 +356,11 @@ export const register: Register = on => {
     }
     if (isMain) await reconcile($)
     await refreshStatus($)
+    if (isMain) {
+      if (G.phase === 'writing' && G.armed) await finishAar($)
+      else await maybeTrigger($)
+      await checkResume($)
+    }
     return r
   })
 
@@ -260,7 +385,9 @@ export const register: Register = on => {
       week: week ? { pct: week.percentUsed, resetsAt: week.resetsAt } : u.week,
     }))
     await refreshStatus($)
-    return next(e)
+    const ran = await next(e)
+    await maybeTrigger($)
+    return ran
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -303,6 +430,11 @@ export const register: Register = on => {
             {reset(u.week)}
           </Text>
         </Box>
+        {G.phase !== 'idle' && (
+          <Text color="yellow">
+            Limit guard: {G.phase === 'writing' ? 'writing the AAR' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()}`}
+          </Text>
+        )}
         <Text dimColor>red used · white estimated for the tasks left · dim unused</Text>
         <Text dimColor>
           Session: {fmtTok(u.tokens)} effective tokens · ${u.usd.toFixed(2)}
