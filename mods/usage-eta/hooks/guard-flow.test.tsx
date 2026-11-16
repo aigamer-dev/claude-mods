@@ -1,9 +1,11 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { MARKER, RESUME_MARKER } from './guard'
+import { DRAIN_MAX_MS, MARKER, RESUME_MARKER } from './guard'
 
 const T0 = 1_700_000_000_000
 const MIN = 60_000
+
+let CLK: any
 
 /** Boots the mod on a mocked world and records what the guard does. */
 async function boot($: any, on: any, aarExists = true) {
@@ -12,7 +14,10 @@ async function boot($: any, on: any, aarExists = true) {
   on('store.get', (_: any, e: any) => ({ value: store[e.key] }))
   on('store.set', (_: any, e: any) => ((store[e.key] = e.value), { value: undefined }))
   on('store.delete', (_: any, e: any) => (delete store[e.key], { value: undefined }))
+  const agents: any[] = []
   const seen = { abort: [] as string[], submits: [] as string[], commands: [] as string[], procs: [] as string[][], toasts: [] as string[] }
+  on('agent.list', () => ({ value: agents }))
+  on('store.keys', () => ({ value: Object.keys(store) }))
   on('session.cwd', () => ({ value: '/work/proj' }))
   on('session.id', () => ({ value: 'old-session-id' }))
   on('session.messages', () => ({ value: [] }))
@@ -33,7 +38,8 @@ async function boot($: any, on: any, aarExists = true) {
   on('turn.complete', (_: any, e: any) => ({ text: '', turnId: e.turnId }) as never)
   await $.session.start({ cwd: '/work/proj', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'TaskCreate', subject: 'Huge refactor (~180m)', description: 'x' })
-  return { clock, store, seen }
+  CLK = clock
+  return { clock, store, seen, agents }
 }
 
 const measure = ($: any, pct: number, resetInMin: number) =>
@@ -43,43 +49,113 @@ const measure = ($: any, pct: number, resetInMin: number) =>
     changed: ['rateLimits'],
   })
 const startTurn = ($: any, turnId: string, text: string) => $.turn.start({ text, turnId })
-const endTurn = ($: any, turnId: string) =>
-  $.turn.complete({ turnId, reason: 'answer', answer: '', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
+const endTurn = async ($: any, turnId: string) => {
+  await $.turn.complete({ turnId, reason: 'answer', answer: '', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
+  await CLK.advance(1000) // timers the hook armed (the AAR request goes out from one)
+}
 
-test('mock flow: 96% used + big estimate, reset in 3h -> AAR, clear, resume after reset, purge old session', async ($, on) => {
+test('mock flow: 96% used, reset in 3h -> drain without aborting, AAR, clear, resume after reset, purge old session', async ($, on) => {
   const { clock, store, seen } = await boot($, on)
   await startTurn($, 't1', 'keep working')
   await measure($, 96, 180)
-  await endTurn($, 't1')
 
-  // 1. trips: running turn stopped, AAR requested
-  expect(seen.abort).toEqual(['t1'])
+  // 1. trips into draining: nothing is aborted, new work is refused, the AAR files stay writable
+  expect(seen.abort).toEqual([])
+  expect(seen.submits).toEqual([])
+  const denied: any = await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  expect(denied.deny).toContain('Usage guard')
+  expect(((await $.tool.call({ tool: 'Write', file_path: '/etc/passwd', content: 'x' })) as any).deny).toContain('Usage guard')
+  expect(((await $.tool.call({ tool: 'Write', file_path: '/work/proj/.claude/aar/x/../../../evil', content: 'x' })) as any).deny).toBeDefined()
+
+  // 2. the running turn ends on its own -> the AAR is requested, once
+  await endTurn($, 't1')
   expect(seen.submits).toHaveLength(1)
   expect(seen.submits[0]).toContain(MARKER)
-  expect(seen.submits[0]).toContain('/work/proj/.claude/aar/AAR-')
-
-  // a second reading while the AAR is being written must not trip again
+  expect(seen.submits[0]).toContain('/work/proj/.claude/aar/')
+  expect(seen.submits[0]).toContain('agent-*.md')
   await measure($, 97, 180)
   expect(seen.submits).toHaveLength(1)
 
-  // 2. AAR turn runs and completes -> pending resume saved, clear scheduled
+  // 3. the AAR turn writes into the AAR folder, then completes -> resume saved, clear scheduled
+  const aarFile = /(\/work\/proj\/\.claude\/aar\/[^ ]+\/AAR\.md)/.exec(seen.submits[0])![1]
+  expect(((await $.tool.call({ tool: 'Write', file_path: aarFile, content: 'x' })) as any).deny).toBeUndefined()
   await startTurn($, 't2', seen.submits[0])
   await endTurn($, 't2')
   expect((store['resume:/work/proj'] as any).cleared).toBe(true)
   await clock.advance(2500)
   expect(seen.commands).toEqual(['clear'])
 
-  // 3. before the reset: nothing resumes
+  // 4. paused: even reads of the repo are the only thing allowed
+  expect(((await $.tool.call({ tool: 'Write', file_path: aarFile, content: 'y' })) as any).deny).toContain('paused')
+
+  // 5. before the reset nothing resumes; after it (+ slack) the fresh session resumes, old one purged
   await clock.advance(170 * MIN)
   expect(seen.submits).toHaveLength(1)
-
-  // 4. after the reset (+ slack): resume from the AAR in the fresh session, old session purged
   await clock.advance(11 * MIN)
   expect(seen.submits).toHaveLength(2)
   expect(seen.submits[1]).toContain(RESUME_MARKER)
   expect(seen.submits[1]).toContain('fresh session')
   expect(seen.procs.some(a => a.includes('old-session-id'))).toBe(true)
   expect(store['resume:/work/proj']).toBeUndefined()
+})
+
+test('mock flow: running subagents are told to checkpoint, not killed; the AAR waits for them', async ($, on) => {
+  const { clock, seen, agents } = await boot($, on)
+  agents.push({ id: 'a1abcdef-1', type: 'general-purpose', status: 'running', description: 'review' })
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1') // main loop idle, but the subagent still runs
+  expect(seen.abort).toEqual([])
+  expect(seen.submits).toEqual([]) // no AAR yet
+
+  // the subagent's next tool call is refused with its checkpoint instructions; its checkpoint write passes
+  const d: any = await $.tool.call({ tool: 'Bash', command: 'make build', agentId: 'a1abcdef-1' })
+  expect(d.deny).toContain('checkpoint')
+  expect(d.deny).toContain('agent-a1abcdef.md')
+  const ok: any = await $.tool.call({ tool: 'Write', file_path: d.deny.match(/(\/work\/proj\/\S+agent-a1abcdef\.md)/)[1], content: 'cp', agentId: 'a1abcdef-1' })
+  expect(ok.deny).toBeUndefined()
+
+  // it finishes; the next tick writes the AAR
+  agents.length = 0
+  await clock.advance(31_000)
+  expect(seen.submits).toHaveLength(1)
+  expect(seen.submits[0]).toContain(MARKER)
+})
+
+test('mock flow: a subagent that never ends does not block the AAR past the drain limit', async ($, on) => {
+  const { clock, seen, agents } = await boot($, on)
+  agents.push({ id: 'stuck-agent-1', type: 'general-purpose', status: 'running', description: 'x' })
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  await clock.advance(DRAIN_MAX_MS - 60_000)
+  expect(seen.submits).toEqual([])
+  await clock.advance(2 * 60_000)
+  expect(seen.submits).toHaveLength(1)
+})
+
+test('mock flow: more live sessions and threads trip the guard earlier', async ($, on) => {
+  const { store, seen } = await boot($, on)
+  // alone, 90% used is under the 95% line
+  await startTurn($, 't1', 'keep working')
+  await measure($, 90, 180)
+  await endTurn($, 't1')
+  expect(seen.submits).toEqual([])
+  // another live session with 4 threads: 5 AARs must fit in the same window
+  store['live:other-session'] = { t: T0, threads: 4, cwd: '/other' }
+  await startTurn($, 't3', 'more work')
+  await measure($, 91, 180)
+  await endTurn($, 't3')
+  expect(seen.submits).toHaveLength(1)
+  expect(seen.submits[0]).toContain('5 thread(s)')
+})
+
+test('mock flow: a trip in another session trips this one in the same window', async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  store['guard:trip'] = { resetsAt: new Date(T0 + 3 * 60 * MIN).toISOString(), at: T0 }
+  await clock.advance(31_000)
+  expect(seen.submits).toHaveLength(1)
+  expect(seen.submits[0]).toContain(MARKER)
 })
 
 test('mock flow: reset in 20 min keeps the session (cache warm) and resumes in place', async ($, on) => {
@@ -101,10 +177,10 @@ test('mock flow: reset in 20 min keeps the session (cache warm) and resumes in p
 test('mock flow: below the thresholds the guard stays quiet', async ($, on) => {
   const { seen } = await boot($, on)
   await startTurn($, 't1', 'keep working')
-  await measure($, 80, 180) // 80 + ~11% est: under 95% used
+  await measure($, 80, 180)
+  await endTurn($, 't1')
   expect(seen.submits).toEqual([])
-  await measure($, 95, 180); await endTurn($, 't1') // used 95 but est 95 + ~11 > 98 -> trips
-  expect(seen.submits).toHaveLength(1)
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
 })
 
 test('mock flow: if the AAR file is missing the guard backs off and does not clear', async ($, on) => {

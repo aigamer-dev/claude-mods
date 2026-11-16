@@ -20,16 +20,27 @@ import {
 } from './estimator'
 import type { Todo } from './estimator'
 import {
+  AAR_COST_PCT,
+  DRAIN_MAX_MS,
+  LIVE_MS,
   MARKER,
+  STATE_KEY,
+  TRIP_KEY,
+  aarDirOf,
   aarPath,
   aarPrompt,
+  countThreads,
+  denyText,
+  liveKey,
   planResume,
   purgeScript,
   resumePrompt,
-  shouldTrigger,
+  shouldTripAt,
   storeKey,
+  thresholds,
+  toolAllowed,
 } from './guard'
-import type { Pending, Phase } from './guard'
+import type { Live, Pending, Phase, Trip } from './guard'
 import type { Model } from './estimator'
 
 const PANE = 'usage-eta'
@@ -64,18 +75,24 @@ const effective = (u: {
 
 const skillName = (s: string) => s.replace(/^egm:/, '')
 
-/** Limit-guard state: idle, writing the AAR, or waiting for the reset. */
+/** Limit-guard state: idle, draining, writing the AAR, or waiting for the reset. */
 const G = {
   phase: 'idle' as Phase,
-  /** The main loop's running turn, so the guard can stop it. */
+  /** The main loop's running turn, so the guard can stop it as a last resort. */
   turnId: undefined as string | undefined,
+  /** True while the main loop is in a turn. */
+  running: false,
   /** True once the AAR turn this guard asked for has started. */
   armed: false,
   aar: '',
   used: 0,
   est: 0,
+  threads: 1,
+  drainAt: 0,
   resetsAt: undefined as string | undefined,
   pending: undefined as Pending | undefined,
+  /** Recent five-hour readings, for the burn rate. */
+  readings: [] as { t: number; pct: number }[],
 }
 
 const S = {
@@ -176,30 +193,106 @@ async function endStep($: EngineInterface, id: string) {
   )
 }
 
-/** Trips the guard: stop the running turn and ask for the AAR. */
+/** Percent of the 5h window burned per minute over the last ten minutes. */
+function burnRate(now: number) {
+  const r = G.readings.filter(x => now - x.t <= 10 * 60_000)
+  if (r.length < 2) return 0
+  const [first, last] = [r[0], r[r.length - 1]]
+  const mins = (last.t - first.t) / 60000
+  return mins > 0.5 ? Math.max(0, (last.pct - first.pct) / mins) : 0
+}
+
+/** This session's threads (main + running agents) and every live session's, summed. */
+async function liveThreads($: EngineInterface) {
+  const now = await $.clock.now()
+  const agents = await $.agent.list().catch(() => [])
+  const running = agents.filter(a => a.status === 'running').length
+  const own = 1 + running
+  const sid = await $.session.id()
+  const live: Live[] = []
+  for (const k of await $.store.keys().catch(() => [] as string[])) {
+    if (!k.startsWith('live:') || k === liveKey(sid)) continue
+    const v = (await $.store.get(k)) as Live | undefined
+    if (v && now - v.t <= LIVE_MS) live.push(v)
+    else await $.store.delete(k)
+  }
+  return { own, running, n: countThreads(live, now, own), others: live.length }
+}
+
+async function heartbeat($: EngineInterface) {
+  const [now, sid, cwd, lt] = [await $.clock.now(), await $.session.id(), await $.session.cwd(), await liveThreads($)]
+  await $.store.set(liveKey(sid), { t: now, threads: lt.own, cwd } satisfies Live)
+}
+
+const aarCost = async ($: EngineInterface) =>
+  ((await $.store.get(STATE_KEY)) as number | undefined) ?? AAR_COST_PCT
+
+/**
+ * Trips the guard: no new work starts, running calls and agents finish and
+ * checkpoint, then the AAR is written. The thresholds tighten with the number
+ * of threads that must write an AAR from the same window, and a trip in one
+ * session trips every other session in that window.
+ */
 async function maybeTrigger($: EngineInterface) {
   if (G.phase !== 'idle') return
   const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
   const now = await $.clock.now()
   const f = forecast(t, g, u, S.model, now)
-  const used = u.fiveHour?.pct
-  if (!shouldTrigger(used, f.pctNeeded) || used === undefined) return
+  // A reading whose window has already reset is stale: the next response refreshes it.
+  const stale = !!u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now
+  const used = stale ? undefined : u.fiveHour?.pct
+  const lt = await liveThreads($)
+  const th = thresholds(lt.n, await aarCost($), burnRate(now))
+  const own = shouldTripAt(used, f.pctNeeded, th)
+  const trip = (await $.store.get(TRIP_KEY)) as Trip | undefined
+  const shared = !!trip && Date.parse(trip.resetsAt) > now
+  if (!own && !shared) return
+  const hasWork = G.running || lt.running > 0 || f.pending > 0 || (g && !g.doneAt)
+  if (!hasWork) return
+  const resetsAt = (stale ? undefined : u.fiveHour?.resetsAt) ?? trip?.resetsAt
+  if (own) {
+    await $.store.set(TRIP_KEY, { resetsAt: resetsAt ?? new Date(now + 5 * 3600_000).toISOString(), at: now } satisfies Trip)
+  }
+  G.phase = 'draining'
+  G.armed = false
+  G.used = used ?? 0
+  G.est = (used ?? 0) + f.pctNeeded
+  G.threads = lt.n
+  G.drainAt = now
+  G.resetsAt = resetsAt
+  G.aar = aarPath(await $.session.cwd(), now)
+  $.ui.toast(
+    `5h limit ${used?.toFixed(0) ?? '?'}% (guard trips at ${th.used.toFixed(0)}% for ${lt.n} thread(s)): ` +
+      'finishing running work, then writing the AAR',
+  )
+  await advanceDrain($)
+}
+
+/** Draining ends when the main loop is idle and no agent runs (or after DRAIN_MAX_MS). */
+async function advanceDrain($: EngineInterface) {
+  if (G.phase !== 'draining') return
+  const now = await $.clock.now()
+  const lt = await liveThreads($)
+  const late = now - G.drainAt > DRAIN_MAX_MS
+  if (G.running && late && G.turnId) {
+    // Last resort: a turn that never ends. Its work was denied new tools long ago.
+    await $.turn.abort({ turnId: G.turnId } as never).catch(() => undefined)
+    return
+  }
+  if (G.running || (lt.running > 0 && !late)) return
   G.phase = 'writing'
   G.armed = false
-  G.used = used
-  G.est = used + f.pctNeeded
-  G.resetsAt = u.fiveHour?.resetsAt
-  const cwd = await $.session.cwd()
-  G.aar = aarPath(cwd, now)
-  const resetIn = fmtMin(f.minsToReset ?? 300)
-  $.ui.toast(`5h limit ${used.toFixed(0)}% (est ${G.est.toFixed(0)}%): writing the AAR, then pausing until the reset`)
-  if (G.turnId) await $.turn.abort({ turnId: G.turnId } as never).catch(() => undefined)
-  void $.prompt.submit({ text: aarPrompt(G.aar, used, G.est, resetIn) }).catch(() => {
-    G.phase = 'idle'
+  const resetIn = fmtMin(Math.max(0, (Date.parse(G.resetsAt ?? '') - now) / 60000) || 300)
+  // Submitted from a timer: a prompt cannot be queued from inside the hook of the turn it follows.
+  const text = aarPrompt(G.aar, G.used, G.est, resetIn, G.threads)
+  $.clock.after(500, () => {
+    void $.prompt.submit({ text }).catch(() => {
+      G.phase = 'idle'
+    })
   })
 }
 
-/** The AAR turn is done: decide between clearing and keeping the session, arm the resume. */
+/** The AAR turn is done: learn its cost, then clear or keep the session and arm the resume. */
 async function finishAar($: EngineInterface) {
   const now = await $.clock.now()
   const cwd = await $.session.cwd()
@@ -208,6 +301,12 @@ async function finishAar($: EngineInterface) {
     G.phase = 'idle'
     $.ui.toast('AAR was not written; the limit guard is off until the next trip')
     return
+  }
+  const pct = (await read($, usage)).fiveHour?.pct
+  if (pct !== undefined && pct > G.used) {
+    const per = Math.min(8, Math.max(0.2, (pct - G.used) / G.threads))
+    const old = await aarCost($)
+    await $.store.set(STATE_KEY, old + 0.5 * (per - old))
   }
   const plan = planResume(now, G.resetsAt)
   const pending: Pending = {
@@ -262,7 +361,12 @@ export const register: Register = on => {
     void $.ui.open({ id: PANE, title: 'Usage & ETA' })
     $.clock.every(30000, () => {
       $.ui.invalidate('ui.render')
-      void checkResume($)
+      void (async () => {
+        await heartbeat($)
+        await checkResume($)
+        await advanceDrain($)
+        await maybeTrigger($)
+      })().catch(() => undefined)
     })
     // A restart while waiting for the reset: pick the pending resume back up.
     const saved = (await $.store.get(storeKey(await $.session.cwd()))) as Pending | undefined
@@ -277,6 +381,7 @@ export const register: Register = on => {
     const agentId = (e as { agentId?: string }).agentId
     if (!agentId) {
       G.turnId = e.turnId
+      G.running = true
       if (G.phase === 'writing' && e.text.includes(MARKER)) G.armed = true
     }
     return next(e)
@@ -299,6 +404,13 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
+    if (G.phase !== 'idle') {
+      const dir = aarDirOf(G.aar || G.pending?.aar || '')
+      const agentId = (e as { agentId?: string }).agentId
+      if (!toolAllowed(G.phase, tool, e as unknown as { file_path?: string; command?: string }, dir)) {
+        return { deny: denyText(G.phase, !!agentId, dir, agentId ?? '') }
+      }
+    }
     if (tool === 'Agent') {
       const input = e as unknown as { subagent_type?: string; description?: string }
       const id = e.tool_use_id ?? ''
@@ -357,7 +469,9 @@ export const register: Register = on => {
     if (isMain) await reconcile($)
     await refreshStatus($)
     if (isMain) {
+      G.running = false
       if (G.phase === 'writing' && G.armed) await finishAar($)
+      else if (G.phase === 'draining') await advanceDrain($)
       else await maybeTrigger($)
       await checkResume($)
     }
@@ -377,6 +491,7 @@ export const register: Register = on => {
       }
       if (S.lastPct === undefined || five.percentUsed < S.lastPct) S.tokSincePct = 0
       S.lastPct = five.percentUsed
+      G.readings = [...G.readings.slice(-20), { t: await $.clock.now(), pct: five.percentUsed }]
     }
     await update($, usage, u => ({
       ...u,
@@ -432,7 +547,7 @@ export const register: Register = on => {
         </Box>
         {G.phase !== 'idle' && (
           <Text color="yellow">
-            Limit guard: {G.phase === 'writing' ? 'writing the AAR' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()}`}
+            Limit guard: {G.phase === 'draining' ? 'finishing running work' : G.phase === 'writing' ? 'writing the AAR' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()}`}
           </Text>
         )}
         <Text dimColor>red used · white estimated for the tasks left · dim unused</Text>
