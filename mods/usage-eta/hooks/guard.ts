@@ -33,6 +33,15 @@ export const AAR_COST_PCT = 1.5
 export const AAR_SAFETY = 1.5
 /** Minutes of work that may still run while the guard drains. */
 export const DRAIN_MIN = 3
+/**
+ * A fresh 5h reading under this percent means a new window (a reset, or another
+ * account): a pause or a shared trip kept from the old one no longer applies.
+ */
+export const RELEASE_BELOW_PCT = 50
+
+/** True when a fresh 5h reading shows the window that tripped the guard is gone. */
+export const windowFresh = (usedPct: number | undefined): boolean =>
+  usedPct !== undefined && usedPct < RELEASE_BELOW_PCT
 
 export const STATE_KEY = 'guard:cost'
 export const TRIP_KEY = 'guard:trip'

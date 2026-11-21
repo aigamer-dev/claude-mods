@@ -19,12 +19,17 @@ async function boot($: any, on: any, aarExists = true) {
   on('agent.list', () => ({ value: agents }))
   on('store.keys', () => ({ value: Object.keys(store) }))
   on('session.cwd', () => ({ value: '/work/proj' }))
-  on('session.id', () => ({ value: 'old-session-id' }))
+  let sid = 'old-session-id'
+  on('session.id', () => ({ value: sid }))
   on('session.messages', () => ({ value: [] }))
   on('fs.exists', () => ({ value: aarExists }))
   on('turn.abort', (_: any, e: any) => (seen.abort.push(e.turnId), { value: undefined }))
   on('prompt.submit', (_: any, e: any) => (seen.submits.push(e.text), { text: e.text } as never))
-  on('command.run', (_: any, e: any) => (seen.commands.push(e.command), { text: '' } as never))
+  on('command.run', (_: any, e: any) => {
+    seen.commands.push(e.command)
+    if (e.command === 'clear') sid = 'new-session-id' // /clear starts a new session
+    return { text: '' } as never
+  })
   on('process.run', (_: any, e: any) => (seen.procs.push([...e.argv]), { value: { exitCode: 0, stdout: '', stderr: '' } }))
   on('ui.toast', (_: any, e: any) => (seen.toasts.push(e.text), { value: undefined }))
   on('command.register', () => ({ value: { command: 'eta' } }))
@@ -193,4 +198,64 @@ test('mock flow: if the AAR file is missing the guard backs off and does not cle
   await clock.advance(5000)
   expect(seen.commands).toEqual([])
   expect(seen.toasts.some(t => /not written/.test(t))).toBe(true)
+})
+
+test('mock flow: a fresh low reading (reset or another account) resumes a stale pause at once', async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  await startTurn($, 't2', seen.submits[0])
+  await endTurn($, 't2')
+  await clock.advance(2500)
+  expect(((await $.tool.call({ tool: 'Bash', command: 'ls' })) as any).deny).toContain('paused')
+  // the account changes: the new window reads 3%, long before the old reset
+  await measure($, 3, 290)
+  expect(seen.submits).toHaveLength(2)
+  expect(seen.submits[1]).toContain(RESUME_MARKER)
+  expect(store['resume:/work/proj']).toBeUndefined()
+  expect(store['guard:trip']).toBeUndefined()
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+})
+
+test('mock flow: a stale shared trip does not trip a session whose window is fresh', async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  store['guard:trip'] = { resetsAt: new Date(T0 + 3 * 60 * MIN).toISOString(), at: T0 }
+  await measure($, 3, 290)
+  await clock.advance(31_000)
+  expect(seen.submits).toEqual([])
+  expect(store['guard:trip']).toBeUndefined()
+})
+
+test('/eta override releases a paused guard and its saved state', async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  await startTurn($, 't2', seen.submits[0])
+  await endTurn($, 't2')
+  await clock.advance(2500)
+  expect(store['resume:/work/proj']).toBeDefined()
+  const r: any = await $.command.run({ command: 'eta', args: 'override' })
+  expect(r.text).toContain('released')
+  expect(store['resume:/work/proj']).toBeUndefined()
+  expect(store['guard:trip']).toBeUndefined()
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+  // and nothing resumes later on its own
+  await clock.advance(200 * MIN)
+  expect(seen.submits).toHaveLength(1)
+})
+
+test('a resume never moves the transcript of the running session', async ($, on) => {
+  const { clock, seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  await startTurn($, 't2', seen.submits[0])
+  await endTurn($, 't2')
+  // the clear is never run here, so the session id stays the same
+  seen.commands.length = 0
+  await clock.advance(200 * MIN)
+  expect(seen.submits).toHaveLength(2)
+  expect(seen.procs.some(a => a.includes('old-session-id'))).toBe(seen.commands.includes('clear'))
 })

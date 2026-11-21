@@ -39,6 +39,7 @@ import {
   storeKey,
   thresholds,
   toolAllowed,
+  windowFresh,
 } from './guard'
 import type { Live, Pending, Phase, Trip } from './guard'
 import type { Model } from './estimator'
@@ -91,6 +92,8 @@ const G = {
   drainAt: 0,
   resetsAt: undefined as string | undefined,
   pending: undefined as Pending | undefined,
+  /** Set by /eta override: the guard stays off until this time (the window's reset). */
+  holdUntil: 0,
   /** Recent five-hour readings, for the burn rate. */
   readings: [] as { t: number; pct: number }[],
 }
@@ -237,6 +240,7 @@ async function maybeTrigger($: EngineInterface) {
   if (G.phase !== 'idle') return
   const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
   const now = await $.clock.now()
+  if (now < G.holdUntil) return
   const f = forecast(t, g, u, S.model, now)
   // A reading whose window has already reset is stale: the next response refreshes it.
   const stale = !!u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now
@@ -245,7 +249,9 @@ async function maybeTrigger($: EngineInterface) {
   const th = thresholds(lt.n, await aarCost($), burnRate(now))
   const own = shouldTripAt(used, f.pctNeeded, th)
   const trip = (await $.store.get(TRIP_KEY)) as Trip | undefined
-  const shared = !!trip && Date.parse(trip.resetsAt) > now
+  // A trip kept from a window this reading shows is gone (reset, or another account) is dropped.
+  if (trip && windowFresh(used)) await $.store.delete(TRIP_KEY)
+  const shared = !!trip && !windowFresh(used) && Date.parse(trip.resetsAt) > now
   if (!own && !shared) return
   const hasWork = G.running || lt.running > 0 || f.pending > 0 || (g && !g.doneAt)
   if (!hasWork) return
@@ -344,7 +350,8 @@ async function checkResume($: EngineInterface) {
   G.pending = undefined
   await $.store.delete(storeKey(p.cwd))
   void $.prompt.submit({ text: resumePrompt(p.aar, p.cleared) }).catch(() => undefined)
-  if (p.cleared && p.oldSession) {
+  // Never move the transcript of the session that is running now (e.g. one resumed with --resume).
+  if (p.cleared && p.oldSession && p.oldSession !== (await $.session.id())) {
     // Old sessions are moved to ~/archive/_review/<date>/ (manifest), never deleted outright.
     void $.process
       .run(['sh', '-c', purgeScript, 'sh', p.oldSession, p.aar], { timeoutMs: 20000 })
@@ -352,12 +359,44 @@ async function checkResume($: EngineInterface) {
   }
 }
 
+/** Turns the guard off now: drops the pause, the saved resume and the shared trip. */
+async function release($: EngineInterface, why: string) {
+  const cwd = await $.session.cwd()
+  G.phase = 'idle'
+  G.armed = false
+  G.pending = undefined
+  await $.store.delete(storeKey(cwd))
+  await $.store.delete(TRIP_KEY)
+  $.ui.toast(`Limit guard released: ${why}`)
+}
+
+/**
+ * A fresh reading from a new window (a reset, or another account) ends a stale
+ * guard: a pause with an AAR resumes from it now; a drain or AAR request stops.
+ */
+async function maybeRelease($: EngineInterface, usedPct: number, resetsAt: string | undefined) {
+  if (G.phase === 'idle' || !windowFresh(usedPct)) return
+  const now = await $.clock.now()
+  if (resetsAt && Date.parse(resetsAt) <= now) return // stale reading: wait for the next one
+  if (G.phase === 'waiting' && G.pending) {
+    G.pending = { ...G.pending, resumeAt: now }
+    await $.store.delete(TRIP_KEY)
+    $.ui.toast(`5h window at ${usedPct.toFixed(0)}%: resuming from the AAR now`)
+    await checkResume($)
+    return
+  }
+  await release($, `5h window at ${usedPct.toFixed(0)}%`)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await ensure($)
     S.mark = { t: await $.clock.now(), tok: 0 }
     S.todos = []
-    await $.command.register({ name: 'eta', description: 'Show usage limits, tasks and the ETA estimator' })
+    await $.command.register({
+      name: 'eta',
+      description: 'Show usage limits, tasks and the ETA estimator (/eta override releases the limit guard)',
+    })
     void $.ui.open({ id: PANE, title: 'Usage & ETA' })
     $.clock.every(30000, () => {
       $.ui.invalidate('ui.render')
@@ -387,7 +426,16 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'eta' }, async $ => {
+  on('command.run', { command: 'eta' }, async ($, e) => {
+    if (e.args.trim() === 'override') {
+      const was = G.phase
+      if (was === 'idle') return { text: 'usage-eta: the limit guard is not active' }
+      const resetsAt = Date.parse((await read($, usage)).fiveHour?.resetsAt ?? '')
+      const now = await $.clock.now()
+      G.holdUntil = Number.isFinite(resetsAt) && resetsAt > now ? resetsAt : now + 5 * 3600_000
+      await release($, 'overridden with /eta override')
+      return { text: `usage-eta: limit guard released (was ${was}); tools are allowed again` }
+    }
     await $.ui.open({ id: PANE, title: 'Usage & ETA' })
     return { text: await summary($) }
   })
@@ -501,6 +549,7 @@ export const register: Register = on => {
     }))
     await refreshStatus($)
     const ran = await next(e)
+    if (five) await maybeRelease($, five.percentUsed, five.resetsAt)
     await maybeTrigger($)
     return ran
   })
