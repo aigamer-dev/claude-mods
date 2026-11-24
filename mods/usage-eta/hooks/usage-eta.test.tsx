@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyTool, blank, correction, forecast, learnTask, splitEta, syncTodos } from './estimator'
+import { agentMinOf, applyTool, blank, correction, forecast, learnAgent, learnTask, learnTurn, splitEta, syncTodos } from './estimator'
 
 const PANE = {
   plugin: 'usage-eta',
@@ -150,4 +150,45 @@ test('a wait past 40 minutes clears the session, a short one keeps it', () => {
   expect(planResume(now, at(COLD_MIN + 1)).clear).toBe(true)
   expect(planResume(now, at(COLD_MIN - 1)).clear).toBe(false)
   expect(planResume(now, at(10)).resumeAt).toBeGreaterThan(now + 10 * 60000)
+})
+
+test('turns and agent runs teach the model when the model never keeps a todo list', () => {
+  let m = blank()
+  const u = { tokens: 0, usd: 0 }
+  expect(forecast([], null, u, m, 0).isLearning).toBe(true)
+  for (let i = 0; i < 5; i++) m = learnTurn(m, { min: 4, tokens: 120000 })
+  expect(m.nAll).toBe(0)
+  expect(m.nTurn).toBe(5)
+  expect(Math.round((m.turnMin) * 1000) / 1000).toBe(4)
+  expect(m.tokPerMin).toBeGreaterThan(20000) // moved off the default toward 30000
+  m = { ...m, nRate: 3 }
+  expect(forecast([], null, u, m, 0).isLearning).toBe(false)
+  // sub-6s turns are noise
+  expect(learnTurn(m, { min: 0.05, tokens: 1000 })).toBe(m)
+})
+
+test('agent runs are learned per type, falling back to the overall average', () => {
+  let m = blank()
+  expect(agentMinOf(m, undefined, 'general-purpose')).toBe(3)
+  m = learnAgent(m, 'Explore', 10)
+  m = learnAgent(m, 'Explore', 10)
+  m = learnAgent(m, 'worker', 2)
+  expect(m.nAgent).toBe(3)
+  expect(Math.round((agentMinOf(m, undefined, 'Explore')) * 1000) / 1000).toBe(10)
+  expect(Math.round((agentMinOf(m, undefined, 'worker')) * 1000) / 1000).toBe(2)
+  expect(agentMinOf(m, undefined, 'never-seen')).toBe(m.agentAvg)
+  expect(learnAgent(m, 'Explore', 0.01)).toBe(m)
+})
+
+test('with enough turns the running turn is the forecast when there is no todo list', () => {
+  const u = { tokens: 0, usd: 0 }
+  let m = blank()
+  for (let i = 0; i < 5; i++) m = learnTurn(m, { min: 6, tokens: 60000 })
+  const none = forecast([], null, u, m, 10 * 60000)
+  expect(none.pending).toBe(0)
+  const f = forecast([], null, u, m, 10 * 60000, 8 * 60000) // 2 minutes into a 6 minute turn
+  expect(f.pending).toBe(1)
+  expect(Math.round((f.remainingMin) * 1000) / 1000).toBe(4)
+  // too few turns: no guess
+  expect(forecast([], null, u, blank(), 10 * 60000, 8 * 60000).pending).toBe(0)
 })

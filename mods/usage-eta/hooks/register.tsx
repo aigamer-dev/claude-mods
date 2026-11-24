@@ -11,10 +11,13 @@ import {
   fmtMin,
   fmtTok,
   forecast,
+  learnAgent,
   learnEgm,
   learnRate,
   learnTask,
+  learnTurn,
   syncTodos,
+  agentMinOf,
   applyTool,
   TRACKED,
 } from './estimator'
@@ -26,6 +29,7 @@ import {
   HOLD_KEY,
   LIVE_MS,
   MARKER,
+  RESUME_MARKER,
   STATE_KEY,
   TRIP_KEY,
   aarDirOf,
@@ -114,6 +118,34 @@ const S = {
   pctSince: 0,
   lastPct: undefined as number | undefined,
   todos: [] as Todo[],
+  /** The main-loop turn running now: when it began and what the session had spent. */
+  turn: undefined as { id: string; t: number; tok: number; skip: boolean } | undefined,
+  /** Agent calls already timed (a call reaches both the tool.call and agent.spawn hooks). */
+  agentSeen: new Set<string>(),
+}
+
+/** Start of the running main-loop turn, for the forecast when there is no todo list. */
+const turnStart = () => (G.running ? S.turn?.t : undefined)
+
+/** Times one agent run once, whichever hook sees it first, and learns from it. */
+async function timeAgent<T extends { deny?: unknown }>(
+  $: EngineInterface,
+  id: string,
+  type: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const first = id !== '' && !S.agentSeen.has(id)
+  if (first) {
+    if (S.agentSeen.size > 500) S.agentSeen.clear()
+    S.agentSeen.add(id)
+  }
+  const t0 = await $.clock.now()
+  const ran = await run()
+  if (first && ran.deny === undefined) {
+    const min = ((await $.clock.now()) - t0) / 60000
+    await learn($, m => learnAgent(m, type, min)).catch(() => undefined)
+  }
+  return ran
 }
 
 /** The model as the store holds it now (other sessions learn into the same record). */
@@ -198,7 +230,7 @@ async function holdUntil($: EngineInterface): Promise<number> {
 async function summary($: EngineInterface) {
   const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
   const now = await $.clock.now()
-  const f = forecast(t, g, u, S.model, now)
+  const f = forecast(t, g, u, S.model, now, turnStart())
   const five = u.fiveHour ? `5h ${u.fiveHour.pct.toFixed(0)}%` : '5h --'
   const wk = u.week ? ` wk ${u.week.pct.toFixed(0)}%` : ''
   const left = f.pending > 0 || (g && !g.doneAt)
@@ -328,7 +360,7 @@ async function maybeTrigger($: EngineInterface) {
     if (windowFresh(u.fiveHour?.pct) && !(u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now)) await clearHold($)
     return
   }
-  const f = forecast(t, g, u, S.model, now)
+  const f = forecast(t, g, u, S.model, now, turnStart())
   // A reading whose window has already reset is stale: the next response refreshes it.
   const stale = !!u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now
   const used = stale ? undefined : u.fiveHour?.pct
@@ -546,6 +578,13 @@ export const register: Register = on => {
     if (!agentId) {
       G.turnId = e.turnId
       G.running = true
+      S.turn = {
+        id: e.turnId,
+        t: await $.clock.now(),
+        tok: (await read($, usage)).tokens,
+        // The guard's own AAR and resume turns are not typical work: leave them out of the pace.
+        skip: (e.text ?? '').includes(MARKER) || (e.text ?? '').includes(RESUME_MARKER),
+      }
       if (G.phase === 'writing' && e.text.includes(MARKER)) G.armed = true
       if (G.bypass && G.bypass.turnId === undefined && e.text.includes(G.bypass.text)) G.bypass.turnId = e.turnId
     }
@@ -681,7 +720,7 @@ export const register: Register = on => {
       const isNew =
         id !== '' &&
         (await startStep($, id, input.subagent_type ?? 'general-purpose', input.description ?? ''))
-      const ran = await next(e)
+      const ran = await timeAgent($, id, input.subagent_type ?? 'general-purpose', () => next(e))
       if (isNew) await endStep($, id)
       return ran
     }
@@ -709,7 +748,7 @@ export const register: Register = on => {
   on('agent.spawn', async ($, e, next) => {
     const isNew =
       e.tool_use_id !== '' && (await startStep($, e.tool_use_id, e.subagentType, e.description))
-    const ran = await next(e)
+    const ran = await timeAgent($, e.tool_use_id, e.subagentType, () => next(e))
     if (isNew) await endStep($, e.tool_use_id)
     return ran
   })
@@ -723,6 +762,14 @@ export const register: Register = on => {
       await update($, usage, u => ({ ...u, tokens: u.tokens + eff }))
     }
     const isMain = !(e as { agentId?: string }).agentId
+    if (isMain && S.turn && S.turn.id === e.turnId) {
+      const t = S.turn
+      S.turn = undefined
+      const min = (now - t.t) / 60000
+      const tokens = (await read($, usage)).tokens - t.tok
+      // A turn left open for hours is a stall, not work.
+      if (!t.skip && min <= 120) await learn($, m => learnTurn(m, { min, tokens })).catch(() => undefined)
+    }
     const run = await read($, egm)
     if (isMain && run && !run.doneAt && run.steps.every(s => s.doneAt)) {
       const finished = { ...run, doneAt: now }
@@ -783,7 +830,7 @@ export const register: Register = on => {
     await ensure($)
     const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
     const now = await $.clock.now()
-    const f = forecast(t, g, u, S.model, now)
+    const f = forecast(t, g, u, S.model, now, turnStart())
     const reset = (l?: { resetsAt?: string }) =>
       l?.resetsAt ? ` · resets in ${fmtMin((Date.parse(l.resetsAt) - now) / 60000)}` : ''
     const doneCount = t.filter(x => x.status === 'completed').length
@@ -862,7 +909,7 @@ export const register: Register = on => {
             ))}
             {left.map(type => (
               <Text dimColor>
-                ○ {type.replace('egm:', '')} · est {fmtMin(S.model.egm[g.skill]?.agentMin[type] ?? 3)}
+                ○ {type.replace('egm:', '')} · est {fmtMin(agentMinOf(S.model, g.skill, type))}
               </Text>
             ))}
           </Box>
@@ -891,6 +938,9 @@ export const register: Register = on => {
           Model: {S.model.n} ETA samples · llm ×{correction(S.model).toFixed(2)} · error ±
           {(S.model.mape * 100).toFixed(0)}% · {fmtTok(S.model.tokPerMin)} tok/min · {S.model.pctPerMtok.toFixed(1)}%/Mtok
           {f.isLearning ? ' · still learning' : ''}
+        </Text>
+        <Text dimColor>
+          Learned from: {S.model.nAll} tasks · {S.model.nTurn} turns · {S.model.nAgent} agent runs · {S.model.nRate} rate readings
         </Text>
       </Box>
     )

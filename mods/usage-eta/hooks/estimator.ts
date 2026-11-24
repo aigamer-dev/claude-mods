@@ -23,7 +23,22 @@ export type Model = {
   pctPerMtok: number
   nRate: number
   egm: Record<string, EgmProfile>
+  /** Finished main-loop turns learned from (the signal that exists even with no todo list). */
+  nTurn: number
+  /** EWMA of a turn's wall minutes. */
+  turnMin: number
+  /** Finished agent runs learned from, EGM or not. */
+  nAgent: number
+  /** EWMA of an agent run's minutes, over every type. */
+  agentAvg: number
+  /** EWMA of an agent run's minutes per subagent type. */
+  agents: Record<string, number>
 }
+
+/** Samples (tasks + turns + agents) after which the estimator no longer says it is learning. */
+export const MIN_SAMPLES = 5
+/** Rate samples (percent of the 5h window per token) needed for the same. */
+export const MIN_RATE = 3
 
 export const DEFAULT_PLANS: Record<string, string[]> = {
   'egm-review': [
@@ -45,6 +60,11 @@ export const blank = (): Model => ({
   pctPerMtok: 6,
   nRate: 0,
   egm: {},
+  nTurn: 0,
+  turnMin: 3,
+  nAgent: 0,
+  agentAvg: 3,
+  agents: {},
 })
 
 const ewma = (old: number, x: number, n: number) => {
@@ -65,7 +85,7 @@ export function learnTask(
   const out: Model = { ...m, nAll: m.nAll + 1 }
   out.avgTaskMin = ewma(m.avgTaskMin, actual, m.nAll)
   if (s.tokens > 0) {
-    out.tokPerMin = ewma(m.tokPerMin, clamp(s.tokens / actual, 500, 400000), m.nAll)
+    out.tokPerMin = ewma(m.tokPerMin, clamp(s.tokens / actual, 500, 400000), m.nAll + m.nTurn)
   }
   if (s.eta && s.eta > 0) {
     const predicted = s.eta * correction(m)
@@ -75,6 +95,36 @@ export function learnTask(
   }
   return out
 }
+
+/**
+ * A finished main-loop turn: how long it ran and what it cost. This is what keeps the
+ * estimator learning when the model never keeps a todo list (no task ever finishes).
+ */
+export function learnTurn(m: Model, s: { min: number; tokens: number }): Model {
+  if (!(s.min >= 0.1)) return m
+  const out: Model = { ...m, nTurn: m.nTurn + 1 }
+  out.turnMin = m.nTurn === 0 ? s.min : ewma(m.turnMin, s.min, m.nTurn)
+  if (s.tokens > 0) {
+    out.tokPerMin = ewma(m.tokPerMin, clamp(s.tokens / s.min, 500, 400000), m.nAll + m.nTurn)
+  }
+  return out
+}
+
+/** A finished agent run (any subagent type, EGM or not). */
+export function learnAgent(m: Model, type: string, min: number): Model {
+  if (!(min >= 0.05)) return m
+  const prev = m.agents[type]
+  return {
+    ...m,
+    nAgent: m.nAgent + 1,
+    agentAvg: m.nAgent === 0 ? min : ewma(m.agentAvg, min, m.nAgent),
+    agents: { ...m.agents, [type]: prev === undefined ? min : ewma(prev, min, 3) },
+  }
+}
+
+/** Minutes an agent of this type is expected to run: its EGM profile, its own history, then the overall average. */
+export const agentMinOf = (m: Model, skill: string | undefined, type: string) =>
+  (skill ? m.egm[skill]?.agentMin[type] : undefined) ?? m.agents[type] ?? m.agentAvg
 
 export function learnRate(m: Model, deltaPct: number, tokens: number): Model {
   // Other sessions on the account also spend the limit, so a tiny token count
@@ -205,6 +255,8 @@ export function forecast(
   usage: Usage,
   m: Model,
   now: number,
+  /** Start of the main-loop turn running now, if any: stands in for a missing todo list. */
+  turnStartedAt?: number,
 ): Forecast {
   let rem = 0
   let pending = 0
@@ -222,12 +274,17 @@ export function forecast(
   if (egm && !egm.doneAt) {
     const running = egm.steps.filter(s => !s.doneAt)
     for (const s of running) {
-      const avg = m.egm[egm.skill]?.agentMin[s.type] ?? 3
+      const avg = agentMinOf(m, egm.skill, s.type)
       rem += Math.max(avg * 0.15, avg - (now - s.startedAt) / 60000)
     }
     for (const type of expectedAgents(egm, m)) {
-      rem += m.egm[egm.skill]?.agentMin[type] ?? 3
+      rem += agentMinOf(m, egm.skill, type)
     }
+  }
+  // No todo list and no EGM run: the turn in flight is the work left, once enough turns are known.
+  if (pending === 0 && !(egm && !egm.doneAt) && turnStartedAt !== undefined && m.nTurn >= MIN_SAMPLES) {
+    pending = 1
+    rem += Math.max(m.turnMin * 0.15, m.turnMin - (now - turnStartedAt) / 60000)
   }
   const spread = clamp(m.mape, 0.15, 1)
   const tokens = rem * m.tokPerMin
@@ -259,8 +316,8 @@ export function forecast(
     fits: fitsPct && fitsTime,
     reason,
     pending,
-    // Tasks without a model ETA still teach the pace and the token rate.
-    isLearning: m.nAll < 5 || m.nRate < 3,
+    // Any finished task, turn or agent run teaches the pace and the token rate.
+    isLearning: m.nAll + m.nTurn + m.nAgent < MIN_SAMPLES || m.nRate < MIN_RATE,
   }
 }
 

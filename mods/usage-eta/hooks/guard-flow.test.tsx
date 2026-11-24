@@ -490,3 +490,22 @@ test('/eta resume with no AAR says so; mid-drain it releases the guard', async (
   expect(seen.submits).toEqual([])
   expect(state.exists).toBe(false)
 })
+
+test('turns teach the shared model with no todo list, so it leaves the learning phase', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store } = await boot($, on)
+  for (let i = 0; i < 6; i++) {
+    await startTurn($, `L${i}`, 'work on it')
+    await clock.advance(2 * MIN)
+    await $.turn.complete({ turnId: `L${i}`, reason: 'answer', answer: '', usage: { input_tokens: 40000, output_tokens: 20000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
+  }
+  const m: any = store['model']
+  expect(m.nTurn).toBe(6)
+  expect(m.turnMin).toBeGreaterThan(1.5)
+  expect(m.turnMin).toBeLessThan(2.5)
+  expect(m.tokPerMin).toBeGreaterThan(20000)
+  // the guard's own turns are not learned from
+  await startTurn($, 'AAR', `${MARKER} write it`)
+  await clock.advance(MIN)
+  await $.turn.complete({ turnId: 'AAR', reason: 'answer', answer: '', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
+  expect((store['model'] as any).nTurn).toBe(6)
+})
