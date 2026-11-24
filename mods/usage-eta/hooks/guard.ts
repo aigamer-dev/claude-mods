@@ -45,10 +45,15 @@ export const windowFresh = (usedPct: number | undefined): boolean =>
 
 export const STATE_KEY = 'guard:cost'
 export const TRIP_KEY = 'guard:trip'
+/** Set by /eta override: every session keeps the guard off until `until`. */
+export const HOLD_KEY = 'guard:hold'
+/** How long the guard stays off after an AAR turn that wrote no file (no retry loop). */
+export const AAR_RETRY_MS = 10 * 60_000
 export const liveKey = (sessionId: string) => `live:${sessionId}`
 
 export type Live = { t: number; threads: number; cwd: string }
 export type Trip = { resetsAt: string; at: number }
+export type Hold = { until: number; at: number }
 
 /** Threads writing an AAR at once = the live sessions' threads, this one's included. */
 export function countThreads(live: readonly Live[], now: number, own: number): number {
@@ -78,8 +83,54 @@ export const shouldTripAt = (
   th: { used: number; est: number },
 ): boolean => usedPct !== undefined && usedPct >= th.used && usedPct + pctNeeded > th.est
 
+/**
+ * A path in one comparable form: forward slashes, `.`/`..` resolved, doubled
+ * slashes collapsed, Git Bash (`/c/x`) and WSL (`/mnt/c/x`) drives turned into
+ * `c:/x`, and lower-cased when it is a Windows path (drive letter, or a
+ * backslash in the original), whose file system ignores case.
+ */
+export function normPath(p: string): string {
+  const raw = p.trim()
+  const s = raw.replace(/\\/g, '/').replace(/^\/mnt\/([a-z])(?=\/|$)/i, '/$1').replace(/^\/([a-z])(?=\/|$)/i, '$1:')
+  const unc = s.startsWith('//')
+  const parts: string[] = []
+  for (const seg of s.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') parts.pop()
+    else parts.push(seg)
+  }
+  const lead = /^[a-z]:$/i.test(parts[0] ?? '') ? '' : unc ? '//' : s.startsWith('/') ? '/' : ''
+  const out = lead + parts.join('/')
+  return /^[a-z]:/i.test(out) || raw.includes('\\') ? out.toLowerCase() : out
+}
+
+/** True when `file` is inside `dir` (after both are normalised). */
+export const insideDir = (file: string, dir: string): boolean => {
+  const d = normPath(dir)
+  return d !== '' && normPath(file).startsWith(`${d}/`)
+}
+
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'TaskOutput', 'BashOutput', 'TaskList', 'TaskGet', 'ToolSearch'])
-const READ_BASH = /^\s*(git\s+(status|log|diff|branch|stash\s+list|show)|ls|pwd|cat|head|tail|jobs|ps|wc)\b/
+const GIT_READ = String.raw`git(?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+))?\s+(?:status|log|diff|branch|stash\s+list|show)`
+const READ_BASH = new RegExp(String.raw`^\s*(?:${GIT_READ}|ls|pwd|cat|head|tail|jobs|ps|wc|dir)\b`)
+const READ_PS = new RegExp(
+  String.raw`^\s*(?:${GIT_READ}|Get-ChildItem|Get-Content|Get-Location|Test-Path|Select-String|gci|gc|ls|dir|cat|pwd)\b`,
+  'i',
+)
+const SHELL_META = /[;&|><`$]/
+
+const unquote = (x: string) => x.replace(/^["']|["']$/g, '')
+
+/** `mkdir [-p] <the AAR folder>` and nothing else, in a POSIX or PowerShell form. */
+function isAarMkdir(cmd: string, aarDir: string): boolean {
+  if (SHELL_META.test(cmd)) return false
+  const m =
+    /^\s*mkdir\s+(?:-p\s+)?("[^"]+"|'[^']+'|\S+)\s*$/i.exec(cmd) ??
+    /^\s*New-Item\s+(?:-ItemType\s+Directory\s+|-Force\s+)*(?:-Path\s+)?("[^"]+"|'[^']+'|\S+)(?:\s+-ItemType\s+Directory|\s+-Force)*\s*$/i.exec(cmd)
+  if (!m) return false
+  const target = unquote(m[1])
+  return normPath(target) === normPath(aarDir) || insideDir(`${target}/x`, aarDir)
+}
 
 /** What a tool may do while the guard is draining or writing; the rest is refused. */
 export function toolAllowed(
@@ -92,23 +143,27 @@ export function toolAllowed(
   if (READ_TOOLS.has(tool)) return true
   if (phase === 'waiting') return false
   if ((tool === 'Write' || tool === 'Edit') && typeof input.file_path === 'string') {
-    return input.file_path.startsWith(`${aarDir}/`) && !input.file_path.includes('..')
+    return insideDir(input.file_path, aarDir)
   }
-  if (tool === 'Bash' && typeof input.command === 'string') {
-    return READ_BASH.test(input.command) && !/[;&|><`$]/.test(input.command)
+  if ((tool === 'Bash' || tool === 'PowerShell') && typeof input.command === 'string') {
+    const cmd = input.command
+    if (isAarMkdir(cmd, aarDir)) return true
+    return (tool === 'Bash' ? READ_BASH : READ_PS).test(cmd) && !SHELL_META.test(cmd)
   }
   return false
 }
 
 export const denyText = (phase: Phase, isAgent: boolean, aarDir: string, id: string) =>
   phase === 'waiting'
-    ? 'Usage guard: paused until the 5h window resets. Do nothing; reply with one word.'
+    ? 'Usage guard: paused until the 5h window resets (the person can run /eta override to lift it). ' +
+      'Do nothing; reply with one word.'
     : isAgent
       ? `Usage guard: the 5h limit is nearly spent. Start nothing new. Write your checkpoint now with Write to ` +
         `${aarDir}/agent-${id.slice(0, 8)}.md (task, done, in progress, next steps, files touched, background ` +
         'work you started and where its output goes), then reply with only that path. Reading is still allowed.'
       : 'Usage guard: the 5h limit is nearly spent. Start no new work and spawn no agents. Running work is ' +
-        'allowed to finish and checkpoint; end your turn now with one short line. An AAR request follows.'
+        'allowed to finish and checkpoint; end your turn now with one short line. An AAR request follows. ' +
+        `Only Write/Edit inside ${aarDir}/ is allowed, as an absolute path.`
 
 export type Pending = {
   aar: string
@@ -134,13 +189,14 @@ export function planResume(now: number, resetsAt: string | undefined) {
 
 export const stamp = (ms: number) => new Date(ms).toISOString().replace(/[:.]/g, '-').slice(0, 19)
 
-export const aarPath = (cwd: string, ms: number) => `${cwd}/.claude/aar/${stamp(ms)}/AAR.md`
+export const aarPath = (cwd: string, ms: number) =>
+  `${cwd.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/aar/${stamp(ms)}/AAR.md`
 
 export const aarPrompt = (path: string, usedPct: number, estPct: number, resetIn: string, threads: number) =>
   `${MARKER} The 5h usage limit is at ${usedPct.toFixed(0)}% and the work left is estimated at ` +
   `${estPct.toFixed(0)}% total (${threads} thread(s) are writing AARs from this window), so it will not fit ` +
   `before the reset (in ${resetIn}). Stop all other work now and write an AAR (after-action report) to ${path} ` +
-  `(create the folder if missing). First read every agent-*.md checkpoint in ${path.replace(/\/[^/]*$/, '')} ` +
+  `(the Write tool creates the folder: do not run mkdir; use exactly this absolute path). First read every agent-*.md checkpoint in ${aarDirOf(path)} ` +
   'and fold each into the AAR. List every background shell or agent still running (id, purpose, where its ' +
   'output lands) and every uncommitted change (git status) so nothing is lost. Keep it compact: your budget ' +
   'is a few thousand tokens. It must let a fresh ' +
@@ -164,4 +220,4 @@ export const purgeScript =
 
 export const storeKey = (cwd: string) => `resume:${cwd}`
 
-export const aarDirOf = (aar: string) => aar.replace(/\/[^/]*$/, '')
+export const aarDirOf = (aar: string) => aar.replace(/[\\/][^\\/]*$/, '')

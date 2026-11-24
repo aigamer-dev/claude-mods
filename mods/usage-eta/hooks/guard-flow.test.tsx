@@ -8,7 +8,7 @@ const MIN = 60_000
 let CLK: any
 
 /** Boots the mod on a mocked world and records what the guard does. */
-async function boot($: any, on: any, aarExists = true) {
+async function boot($: any, on: any, aarExists = true, cwd = '/work/proj') {
   const clock = mock.clock(on, { now: T0 })
   const store: Record<string, unknown> = {}
   on('store.get', (_: any, e: any) => ({ value: store[e.key] }))
@@ -18,7 +18,7 @@ async function boot($: any, on: any, aarExists = true) {
   const seen = { abort: [] as string[], submits: [] as string[], commands: [] as string[], procs: [] as string[][], toasts: [] as string[] }
   on('agent.list', () => ({ value: agents }))
   on('store.keys', () => ({ value: Object.keys(store) }))
-  on('session.cwd', () => ({ value: '/work/proj' }))
+  on('session.cwd', () => ({ value: cwd }))
   let sid = 'old-session-id'
   on('session.id', () => ({ value: sid }))
   on('session.messages', () => ({ value: [] }))
@@ -40,8 +40,8 @@ async function boot($: any, on: any, aarExists = true) {
   on('tool.call', () => ({ result: {}, text: 'Task #1 created successfully' }))
   on('turn.start', (_: any, e: any) => ({ turnId: e.turnId }) as never)
   on('session.measure', () => ({ changed: ['rateLimits'] }) as never)
-  on('turn.complete', (_: any, e: any) => ({ text: '', turnId: e.turnId }) as never)
-  await $.session.start({ cwd: '/work/proj', surface: 'desktop', isInteractive: true })
+  on('turn.complete', (_: any, e: any) => ({ text: '', turnId: e.turnId, usage: e.usage }) as never)
+  await $.session.start({ cwd, surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'TaskCreate', subject: 'Huge refactor (~180m)', description: 'x' })
   CLK = clock
   return { clock, store, seen, agents }
@@ -59,7 +59,7 @@ const endTurn = async ($: any, turnId: string) => {
   await CLK.advance(1000) // timers the hook armed (the AAR request goes out from one)
 }
 
-test('mock flow: 96% used, reset in 3h -> drain without aborting, AAR, clear, resume after reset, purge old session', async ($, on) => {
+test('mock flow: 96% used, reset in 3h -> drain without aborting, AAR, clear, resume after reset, purge old session', { timeoutMs: 60_000 }, async ($, on) => {
   const { clock, store, seen } = await boot($, on)
   await startTurn($, 't1', 'keep working')
   await measure($, 96, 180)
@@ -188,6 +188,35 @@ test('mock flow: below the thresholds the guard stays quiet', async ($, on) => {
   expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
 })
 
+test('mock flow: a Windows cwd writes the AAR with backslashes and mixed case, mkdir and git -C are allowed', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, seen } = await boot($, on, true, 'C:\\Users\\Me\\proj')
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  const aar = /(C:\/Users\/Me\/proj\/\.claude\/aar\/[^ ]+\/AAR\.md)/.exec(seen.submits[0])![1]
+  expect(aar).not.toContain('\\')
+  await startTurn($, 't2', seen.submits[0])
+  const dir = aar.replace(/\/AAR\.md$/, '')
+  const back = (p: string) => p.replace(/\//g, '\\')
+  const ok = async (input: any) => ((await $.tool.call(input)) as any).deny === undefined
+  expect(await ok({ tool: 'Write', file_path: aar, content: 'x' })).toBe(true)
+  expect(await ok({ tool: 'Write', file_path: back(aar), content: 'x' })).toBe(true)
+  expect(await ok({ tool: 'Write', file_path: back(aar).replace('C:', 'c:'), content: 'x' })).toBe(true)
+  expect(await ok({ tool: 'Edit', file_path: '/c' + dir.slice(2) + '/agent-12345678.md', old_string: 'a', new_string: 'b' })).toBe(true)
+  expect(await ok({ tool: 'Bash', command: `mkdir -p "${dir}"` })).toBe(true)
+  expect(await ok({ tool: 'PowerShell', command: `New-Item -ItemType Directory -Force -Path "${back(dir)}"` })).toBe(true)
+  expect(await ok({ tool: 'Bash', command: 'git -C C:/Users/Me/proj status' })).toBe(true)
+  expect(await ok({ tool: 'PowerShell', command: 'Get-ChildItem C:\\Users\\Me\\proj' })).toBe(true)
+  // still refused: outside the folder, traversal out of it, other dirs, writes through the shell
+  expect(await ok({ tool: 'Write', file_path: 'C:\\Users\\Me\\proj\\src\\a.ts', content: 'x' })).toBe(false)
+  expect(await ok({ tool: 'Write', file_path: back(dir) + '\\..\\..\\..\\..\\evil.txt', content: 'x' })).toBe(false)
+  expect(await ok({ tool: 'Bash', command: 'mkdir -p C:/Users/Me/proj/src' })).toBe(false)
+  expect(await ok({ tool: 'PowerShell', command: 'Remove-Item -Recurse C:\\Users\\Me\\proj' })).toBe(false)
+  expect(await ok({ tool: 'Bash', command: 'ls; rm -rf /' })).toBe(false)
+  await endTurn($, 't2')
+  await clock.advance(1000)
+})
+
 test('mock flow: if the AAR file is missing the guard backs off and does not clear', async ($, on) => {
   const { clock, seen } = await boot($, on, false)
   await startTurn($, 't1', 'keep working')
@@ -198,6 +227,11 @@ test('mock flow: if the AAR file is missing the guard backs off and does not cle
   await clock.advance(5000)
   expect(seen.commands).toEqual([])
   expect(seen.toasts.some(t => /not written/.test(t))).toBe(true)
+  // no retry loop: the next readings do not trip it again until the hold passes
+  await startTurn($, 't3', 'keep working')
+  await measure($, 97, 180)
+  await endTurn($, 't3')
+  expect(seen.submits).toHaveLength(1)
 })
 
 test('mock flow: a fresh low reading (reset or another account) resumes a stale pause at once', async ($, on) => {
@@ -227,7 +261,7 @@ test('mock flow: a stale shared trip does not trip a session whose window is fre
   expect(store['guard:trip']).toBeUndefined()
 })
 
-test('/eta override releases a paused guard and its saved state', async ($, on) => {
+test('/eta override releases a paused guard and its saved state', { timeoutMs: 60_000 }, async ($, on) => {
   const { clock, store, seen } = await boot($, on)
   await startTurn($, 't1', 'keep working')
   await measure($, 96, 180)
@@ -246,7 +280,42 @@ test('/eta override releases a paused guard and its saved state', async ($, on) 
   expect(seen.submits).toHaveLength(1)
 })
 
-test('a resume never moves the transcript of the running session', async ($, on) => {
+test('/eta override holds the guard off in every session until the window resets', { timeoutMs: 60_000 }, async ($, on) => {
+  const { store, seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  expect(seen.submits).toHaveLength(1)
+  const r: any = await $.command.run({ command: 'eta', args: 'override' })
+  expect(r.text).toContain('released')
+  expect((store['guard:hold'] as any).until).toBeGreaterThan(T0)
+  // the guard does not trip again on the next readings
+  await startTurn($, 't3', 'keep working')
+  await measure($, 97, 180)
+  await endTurn($, 't3')
+  expect(seen.submits).toHaveLength(1)
+  // override also works before the guard has tripped
+  const again: any = await $.command.run({ command: 'eta', args: 'override' })
+  expect(again.text).toContain('held off')
+  const back: any = await $.command.run({ command: 'eta', args: 'guard on' })
+  expect(back.text).toContain('on again')
+  expect(store['guard:hold']).toBeUndefined()
+})
+
+test('rate learning keeps the task samples other sessions saved', { timeoutMs: 60_000 }, async ($, on) => {
+  const { store } = await boot($, on)
+  store['model'] = { n: 7, nAll: 9, logRatio: 0.2, mape: 0.3, avgTaskMin: 6, tokPerMin: 30000, pctPerMtok: 6, nRate: 1, egm: {} }
+  await startTurn($, 't1', 'work')
+  await measure($, 10, 180)
+  await $.turn.complete({ turnId: 't1', reason: 'answer', answer: '', usage: { input_tokens: 40000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
+  await measure($, 12, 180)
+  const m: any = store['model']
+  expect(m.nRate).toBe(2)
+  expect(m.n).toBe(7)
+  expect(m.nAll).toBe(9)
+})
+
+test('a resume never moves the transcript of the running session', { timeoutMs: 60_000 }, async ($, on) => {
   const { clock, seen } = await boot($, on)
   await startTurn($, 't1', 'keep working')
   await measure($, 96, 180)

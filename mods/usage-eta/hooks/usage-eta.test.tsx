@@ -83,6 +83,39 @@ test('a finished task is learned from, once', () => {
   expect(again.done).toHaveLength(0)
 })
 
+test('tasks created and finished inside one turn still teach the model', () => {
+  const base = { t: 0, tok: 0 }
+  const r = syncTodos(
+    [],
+    [
+      { content: 'A (~2m)', status: 'completed' },
+      { content: 'B (~2m)', status: 'completed' },
+    ],
+    600_000,
+    100_000,
+    base,
+  )
+  expect(r.done).toHaveLength(2)
+  expect(r.done[0].doneAt).toBe(300_000)
+  expect(r.done[1].startedAt).toBe(300_000)
+  expect(r.done[1].tokDone).toBe(100_000)
+  const again = syncTodos(r.tasks, [{ content: 'A (~2m)', status: 'completed' }], 700_000, 100_000, base)
+  expect(again.done).toHaveLength(0)
+  // a record that was already completed (older state with no time) is not learned from
+  const old = syncTodos([{ id: 'A', text: 'A', status: 'completed' }], [{ content: 'A', status: 'completed' }], 700_000, 0, base)
+  expect(old.done).toHaveLength(0)
+})
+
+test('the estimator stops saying it is learning after enough samples', () => {
+  let m = blank()
+  const tasks = [{ id: 'a', text: 'a', status: 'pending' as const }]
+  const u = { tokens: 0, usd: 0 }
+  expect(forecast(tasks, null, u, m, 0).isLearning).toBe(true)
+  for (let i = 0; i < 5; i++) m = learnTask(m, { actualMin: 4, tokens: 80000 })
+  m = { ...m, nRate: 3 }
+  expect(forecast(tasks, null, u, m, 0).isLearning).toBe(false)
+})
+
 test('a TaskCreate call reaches the pane through the hooks', async ($, on) => {
   on('store.get', () => ({ value: undefined }))
   on('store.set', () => ({ value: undefined }))

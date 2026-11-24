@@ -123,6 +123,8 @@ export function syncTodos(
   base: { t: number; tok: number },
 ): { tasks: Task[]; done: Task[] } {
   const done: Task[] = []
+  /** Tasks first seen already completed: the whole list was written within one stretch. */
+  const batch: Task[] = []
   const tasks = todos.map((t): Task => {
     const { text, eta } = splitEta(t.content)
     const old = prev.find(p => p.text === text)
@@ -134,21 +136,38 @@ export function syncTodos(
       startedAt: old?.startedAt,
       doneAt: old?.doneAt,
       tokStart: old?.tokStart,
+      tokDone: old?.tokDone,
     }
     if (t.status === 'in_progress' && task.startedAt === undefined) {
       task.startedAt = now
       task.tokStart = tok
     }
-    if (t.status === 'completed' && old && old.status !== 'completed') {
+    if (t.status === 'completed' && task.doneAt === undefined) {
       task.doneAt = now
-      if (task.startedAt === undefined) {
-        task.startedAt = base.t
-        task.tokStart = base.tok
+      task.tokDone = tok
+      if (old && old.status === 'completed') {
+        // Already finished before this record carried a time: nothing to learn from.
+      } else if (task.startedAt !== undefined) {
+        done.push(task)
+      } else {
+        batch.push(task)
       }
-      done.push(task)
     }
     return task
   })
+  // Created and finished between two snapshots (e.g. inside one turn): split
+  // the stretch since the last mark evenly, so these still teach the model.
+  const span = now - base.t
+  if (batch.length > 0 && span > 0 && span <= 3 * 3600_000) {
+    const k = batch.length
+    batch.forEach((task, i) => {
+      task.startedAt = base.t + (span * i) / k
+      task.doneAt = base.t + (span * (i + 1)) / k
+      task.tokStart = base.tok + ((tok - base.tok) * i) / k
+      task.tokDone = base.tok + ((tok - base.tok) * (i + 1)) / k
+      done.push(task)
+    })
+  }
   return { tasks, done }
 }
 
@@ -240,7 +259,8 @@ export function forecast(
     fits: fitsPct && fitsTime,
     reason,
     pending,
-    isLearning: m.n < 5 || m.nRate < 3,
+    // Tasks without a model ETA still teach the pace and the token rate.
+    isLearning: m.nAll < 5 || m.nRate < 3,
   }
 }
 

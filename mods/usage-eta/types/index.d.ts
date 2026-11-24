@@ -7,6 +7,8 @@ export type Task = {
   startedAt?: number
   doneAt?: number
   tokStart?: number
+  /** Effective tokens used when the task finished. */
+  tokDone?: number
 }
 
 export type EgmStep = {

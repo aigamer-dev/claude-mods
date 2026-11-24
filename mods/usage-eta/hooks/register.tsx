@@ -21,7 +21,9 @@ import {
 import type { Todo } from './estimator'
 import {
   AAR_COST_PCT,
+  AAR_RETRY_MS,
   DRAIN_MAX_MS,
+  HOLD_KEY,
   LIVE_MS,
   MARKER,
   STATE_KEY,
@@ -41,7 +43,7 @@ import {
   toolAllowed,
   windowFresh,
 } from './guard'
-import type { Live, Pending, Phase, Trip } from './guard'
+import type { Hold, Live, Pending, Phase, Trip } from './guard'
 import type { Model } from './estimator'
 
 const PANE = 'usage-eta'
@@ -92,7 +94,7 @@ const G = {
   drainAt: 0,
   resetsAt: undefined as string | undefined,
   pending: undefined as Pending | undefined,
-  /** Set by /eta override: the guard stays off until this time (the window's reset). */
+  /** The guard stays off until this time; mirrored in the store (HOLD_KEY) for every session. */
   holdUntil: 0,
   /** Recent five-hour readings, for the burn rate. */
   readings: [] as { t: number; pct: number }[],
@@ -103,19 +105,57 @@ const S = {
   loaded: false,
   mark: { t: 0, tok: 0 },
   tokSincePct: 0,
+  /** Percent of the 5h window gained since the rate was last learned. */
+  pctSince: 0,
   lastPct: undefined as number | undefined,
   todos: [] as Todo[],
 }
 
-async function save($: EngineInterface) {
+/** The model as the store holds it now (other sessions learn into the same record). */
+async function loadModel($: EngineInterface): Promise<Model | undefined> {
+  const saved = (await $.store.get('model').catch(() => undefined)) as Model | undefined
+  return saved && typeof saved.n === 'number' ? { ...blank(), ...saved } : undefined
+}
+
+/**
+ * Learns into the shared model. Every session keeps a copy in memory and a long
+ * session's copy goes stale, so a plain "write my copy" erased what the other
+ * sessions had learned (task samples were wiped by each rate save). Re-read,
+ * apply, write.
+ */
+async function learn($: EngineInterface, fn: (m: Model) => Model) {
+  S.model = fn((await loadModel($)) ?? S.model)
   await $.store.set('model', S.model)
 }
 
 async function ensure($: EngineInterface) {
   if (S.loaded) return
   S.loaded = true
-  const saved = (await $.store.get('model')) as Model | undefined
-  if (saved && typeof saved.n === 'number') S.model = { ...blank(), ...saved }
+  const saved = await loadModel($)
+  if (saved) S.model = saved
+}
+
+/** Pulls in what other sessions learned, so the forecast uses the shared model. */
+async function refreshModel($: EngineInterface) {
+  const saved = await loadModel($)
+  if (saved) S.model = saved
+}
+
+/** Keeps the guard off until `until` in every session (what /eta override and a failed AAR set). */
+async function setHold($: EngineInterface, until: number) {
+  G.holdUntil = until
+  await $.store.set(HOLD_KEY, { until, at: await $.clock.now() } satisfies Hold)
+}
+
+async function clearHold($: EngineInterface) {
+  G.holdUntil = 0
+  await $.store.delete(HOLD_KEY)
+}
+
+/** The time the guard is held until: this session's own, or one another session left in the store. */
+async function holdUntil($: EngineInterface): Promise<number> {
+  const h = (await $.store.get(HOLD_KEY).catch(() => undefined)) as Hold | undefined
+  return Math.max(G.holdUntil, typeof h?.until === 'number' ? h.until : 0)
 }
 
 async function summary($: EngineInterface) {
@@ -142,14 +182,19 @@ async function ingest($: EngineInterface, todos: readonly Todo[]) {
   const prev = await read($, tasks)
   const { tasks: nextTasks, done } = syncTodos(prev, todos, now, u.tokens, S.mark)
   await update($, tasks, () => nextTasks)
-  for (const t of done) {
-    S.model = learnTask(S.model, {
-      eta: t.eta,
-      actualMin: ((t.doneAt ?? now) - (t.startedAt ?? now)) / 60000,
-      tokens: u.tokens - (t.tokStart ?? u.tokens),
-    })
+  if (done.length > 0) {
+    await learn($, m =>
+      done.reduce(
+        (acc, t) =>
+          learnTask(acc, {
+            eta: t.eta,
+            actualMin: ((t.doneAt ?? now) - (t.startedAt ?? now)) / 60000,
+            tokens: (t.tokDone ?? u.tokens) - (t.tokStart ?? u.tokens),
+          }),
+        m,
+      ),
+    )
   }
-  if (done.length > 0) await save($)
   S.mark = { t: now, tok: u.tokens }
 }
 
@@ -240,7 +285,12 @@ async function maybeTrigger($: EngineInterface) {
   if (G.phase !== 'idle') return
   const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
   const now = await $.clock.now()
-  if (now < G.holdUntil) return
+  const held = await holdUntil($)
+  if (now < held) {
+    // A held guard whose window turned out fresh (reset, other account) no longer needs the hold.
+    if (windowFresh(u.fiveHour?.pct) && !(u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now)) await clearHold($)
+    return
+  }
   const f = forecast(t, g, u, S.model, now)
   // A reading whose window has already reset is stale: the next response refreshes it.
   const stale = !!u.fiveHour?.resetsAt && Date.parse(u.fiveHour.resetsAt) <= now
@@ -304,8 +354,12 @@ async function finishAar($: EngineInterface) {
   const cwd = await $.session.cwd()
   const wrote = await $.fs.exists(G.aar).catch(() => false)
   if (!wrote) {
+    // Hold the guard off for a while, or the very next reading would trip it again and loop.
     G.phase = 'idle'
-    $.ui.toast('AAR was not written; the limit guard is off until the next trip')
+    await setHold($, now + AAR_RETRY_MS)
+    $.ui.toast(
+      `AAR was not written (expected ${G.aar}); the limit guard is off for ${fmtMin(AAR_RETRY_MS / 60000)}`,
+    )
     return
   }
   const pct = (await read($, usage)).fiveHour?.pct
@@ -401,6 +455,7 @@ export const register: Register = on => {
     $.clock.every(30000, () => {
       $.ui.invalidate('ui.render')
       void (async () => {
+        await refreshModel($)
         await heartbeat($)
         await checkResume($)
         await advanceDrain($)
@@ -409,7 +464,7 @@ export const register: Register = on => {
     })
     // A restart while waiting for the reset: pick the pending resume back up.
     const saved = (await $.store.get(storeKey(await $.session.cwd()))) as Pending | undefined
-    if (saved?.aar && G.phase === 'idle') {
+    if (saved?.aar && G.phase === 'idle' && (await $.clock.now()) >= (await holdUntil($))) {
       G.pending = { ...saved, cleared: true, oldSession: saved.oldSession }
       G.phase = 'waiting'
     }
@@ -427,14 +482,28 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'eta' }, async ($, e) => {
-    if (e.args.trim() === 'override') {
+    const arg = (e.args ?? '').trim().toLowerCase()
+    if (arg === 'guard on' || arg === 'override off') {
+      await clearHold($)
+      return { text: 'usage-eta: the limit guard is on again' }
+    }
+    if (arg === 'override') {
       const was = G.phase
-      if (was === 'idle') return { text: 'usage-eta: the limit guard is not active' }
       const resetsAt = Date.parse((await read($, usage)).fiveHour?.resetsAt ?? '')
       const now = await $.clock.now()
-      G.holdUntil = Number.isFinite(resetsAt) && resetsAt > now ? resetsAt : now + 5 * 3600_000
-      await release($, 'overridden with /eta override')
-      return { text: `usage-eta: limit guard released (was ${was}); tools are allowed again` }
+      // The hold lives in the store, so every session (and a session a /clear starts) honours it.
+      // Phase first, then the store: a failing store call must not leave the guard on.
+      G.phase = 'idle'
+      G.armed = false
+      G.pending = undefined
+      await setHold($, Number.isFinite(resetsAt) && resetsAt > now ? resetsAt : now + 5 * 3600_000).catch(() => undefined)
+      await release($, 'overridden with /eta override').catch(() => undefined)
+      return {
+        text:
+          was === 'idle'
+            ? 'usage-eta: the limit guard is held off until the 5h window resets (/eta guard on turns it back on)'
+            : `usage-eta: limit guard released (was ${was}); tools are allowed again until the 5h window resets`,
+      }
     }
     await $.ui.open({ id: PANE, title: 'Usage & ETA' })
     return { text: await summary($) }
@@ -511,14 +580,14 @@ export const register: Register = on => {
     if (isMain && run && !run.doneAt && run.steps.every(s => s.doneAt)) {
       const finished = { ...run, doneAt: now }
       await update($, egm, () => finished)
-      S.model = learnEgm(S.model, finished, now)
-      await save($)
+      await learn($, m => learnEgm(m, finished, now))
     }
     if (isMain) await reconcile($)
     await refreshStatus($)
     if (isMain) {
       G.running = false
-      if (G.phase === 'writing' && G.armed) await finishAar($)
+      // `armed` can be missed (a rewritten prompt); a written AAR file settles it too.
+      if (G.phase === 'writing' && (G.armed || (await $.fs.exists(G.aar).catch(() => false)))) await finishAar($)
       else if (G.phase === 'draining') await advanceDrain($)
       else await maybeTrigger($)
       await checkResume($)
@@ -532,12 +601,19 @@ export const register: Register = on => {
     const week = pick('seven')
     await ensure($)
     if (five) {
-      if (S.lastPct !== undefined && five.percentUsed > S.lastPct) {
-        S.model = learnRate(S.model, five.percentUsed - S.lastPct, S.tokSincePct)
+      if (S.lastPct !== undefined && five.percentUsed > S.lastPct) S.pctSince += five.percentUsed - S.lastPct
+      if (S.lastPct === undefined || five.percentUsed < S.lastPct) {
         S.tokSincePct = 0
-        await save($)
+        S.pctSince = 0
       }
-      if (S.lastPct === undefined || five.percentUsed < S.lastPct) S.tokSincePct = 0
+      // Too few tokens for the gain is noise (other sessions spend the limit too): keep
+      // accumulating both until there is a real sample, instead of dropping the tokens.
+      if (S.pctSince > 0 && S.tokSincePct >= 20000) {
+        const [pct, tok] = [S.pctSince, S.tokSincePct]
+        S.pctSince = 0
+        S.tokSincePct = 0
+        await learn($, m => learnRate(m, pct, tok))
+      }
       S.lastPct = five.percentUsed
       G.readings = [...G.readings.slice(-20), { t: await $.clock.now(), pct: five.percentUsed }]
     }
