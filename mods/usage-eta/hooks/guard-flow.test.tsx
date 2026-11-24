@@ -509,3 +509,74 @@ test('turns teach the shared model with no todo list, so it leaves the learning 
   await $.turn.complete({ turnId: 'AAR', reason: 'answer', answer: '', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } })
   expect((store['model'] as any).nTurn).toBe(6)
 })
+
+test('/eta pause saves an AAR with no limit trip, holds through resets and resumes only on /eta resume', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 20, 180) // far from any limit
+  const r: any = await $.command.run({ command: 'eta', args: 'pause' })
+  expect(r.text).toContain('pausing')
+  // draining: new work is refused with the pause wording, running work may finish
+  const d: any = await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  expect(d.deny).toContain('/eta pause')
+  expect(seen.submits).toEqual([])
+  await endTurn($, 't1')
+  expect(seen.submits).toHaveLength(1)
+  expect(seen.submits[0]).toContain(MARKER)
+  expect(seen.submits[0]).toContain('pausing this session')
+  expect(seen.submits[0]).not.toContain('5h usage limit')
+  await startTurn($, 't2', seen.submits[0])
+  await endTurn($, 't2')
+  await clock.advance(2500)
+  const saved = store['resume:/work/proj'] as any
+  expect(saved.manual).toBe(true)
+  expect(saved.cleared).toBe(false)
+  expect(seen.commands).toEqual([]) // no /clear for a manual pause
+  expect(store['guard:trip']).toBeUndefined() // other sessions are not tripped
+  expect(((await $.tool.call({ tool: 'Read', file_path: '/work/proj/a.ts' })) as any).deny).toBeUndefined() // reads are fine
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toContain('/eta resume')
+  // hours pass and the limit resets (a fresh low reading): still paused
+  await clock.advance(400 * MIN)
+  await measure($, 3, 290)
+  expect(seen.submits).toHaveLength(1)
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeDefined()
+  expect(((await $.command.run({ command: 'eta', args: 'pause' })) as any).text).toContain('already paused')
+  // back: resume with the pause wording
+  const back: any = await $.command.run({ command: 'eta', args: 'resume' })
+  expect(back.text).toContain('resuming')
+  await clock.advance(1000)
+  expect(seen.submits).toHaveLength(2)
+  expect(seen.submits[1]).toContain(RESUME_MARKER)
+  expect(seen.submits[1]).toContain('paused this session and is back')
+  expect(store['resume:/work/proj']).toBeUndefined()
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+})
+
+test('/eta pause turns a limit pause into one that waits for /eta resume', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen } = await pause($, on)
+  const r: any = await $.command.run({ command: 'eta', args: 'pause' })
+  expect(r.text).toContain('until you run /eta resume')
+  expect((store['resume:/work/proj'] as any).manual).toBe(true)
+  await clock.advance(200 * MIN)
+  expect(seen.submits).toHaveLength(1) // the reset passed and nothing resumed
+  await $.command.run({ command: 'eta', args: 'resume' })
+  await clock.advance(1000)
+  expect(seen.submits).toHaveLength(2)
+  expect(seen.submits[1]).toContain('paused this session and is back')
+})
+
+test('a manual pause survives a restart and an override hold', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen } = await boot($, on)
+  store['guard:hold'] = { until: T0 + 5 * 60 * MIN, at: T0 }
+  store['resume:/work/proj'] = { aar: '/work/proj/.claude/aar/x/AAR.md', cwd: '/work/proj', resumeAt: Number.MAX_SAFE_INTEGER, cleared: false, oldSession: 'gone', manual: true }
+  await $.session.start({ cwd: '/work/proj', surface: 'desktop', isInteractive: true })
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toContain('/eta resume')
+  await clock.advance(400 * MIN)
+  await measure($, 3, 290)
+  expect(seen.submits).toEqual([])
+  await $.command.run({ command: 'eta', args: 'resume' })
+  await clock.advance(1000)
+  expect(seen.submits).toHaveLength(1)
+  expect(seen.submits[0]).toContain('/work/proj/.claude/aar/x/AAR.md')
+  expect(store['guard:hold']).toBeDefined() // resuming a pause does not drop the override hold
+})

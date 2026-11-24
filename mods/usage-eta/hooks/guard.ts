@@ -14,6 +14,9 @@ export const COLD_MIN = 40
 /** Seconds past the reset before resuming, so the new window has registered. */
 export const RESUME_SLACK_MS = 60_000
 
+/** resumeAt of a pause made with /eta pause: no timer ends it, only /eta resume. */
+export const MANUAL_RESUME_AT = Number.MAX_SAFE_INTEGER
+
 export const MARKER = '[usage-eta:aar]'
 export const RESUME_MARKER = '[usage-eta:resume]'
 
@@ -153,17 +156,22 @@ export function toolAllowed(
   return false
 }
 
-export const denyText = (phase: Phase, isAgent: boolean, aarDir: string, id: string) =>
-  phase === 'waiting'
-    ? 'Usage guard: paused until the 5h window resets (the person can run /eta resume to continue from the AAR now, or /eta override to lift it). ' +
-      'Do nothing; reply with one word.'
+export const denyText = (phase: Phase, isAgent: boolean, aarDir: string, id: string, manual = false) => {
+  const why = manual ? 'the person paused this session with /eta pause' : 'the 5h limit is nearly spent'
+  return phase === 'waiting'
+    ? manual
+      ? 'Usage guard: the person paused this session with /eta pause; it stays paused until they run /eta resume. ' +
+        'Do nothing; reply with one word.'
+      : 'Usage guard: paused until the 5h window resets (the person can run /eta resume to continue from the AAR now, or /eta override to lift it). ' +
+        'Do nothing; reply with one word.'
     : isAgent
-      ? `Usage guard: the 5h limit is nearly spent. Start nothing new. Write your checkpoint now with Write to ` +
+      ? `Usage guard: ${why}. Start nothing new. Write your checkpoint now with Write to ` +
         `${aarDir}/agent-${id.slice(0, 8)}.md (task, done, in progress, next steps, files touched, background ` +
         'work you started and where its output goes), then reply with only that path. Reading is still allowed.'
-      : 'Usage guard: the 5h limit is nearly spent. Start no new work and spawn no agents. Running work is ' +
+      : `Usage guard: ${why}. Start no new work and spawn no agents. Running work is ` +
         'allowed to finish and checkpoint; end your turn now with one short line. An AAR request follows. ' +
         `Only Write/Edit inside ${aarDir}/ is allowed, as an absolute path.`
+}
 
 export type Pending = {
   aar: string
@@ -172,6 +180,8 @@ export type Pending = {
   /** True when the session was cleared, so the resume starts from the AAR alone. */
   cleared: boolean
   oldSession: string
+  /** Made with /eta pause: resumes only on /eta resume, whatever the 5h window does. */
+  manual?: boolean
 }
 
 export const shouldTrigger = (usedPct: number | undefined, pctNeeded: number): boolean =>
@@ -192,10 +202,21 @@ export const stamp = (ms: number) => new Date(ms).toISOString().replace(/[:.]/g,
 export const aarPath = (cwd: string, ms: number) =>
   `${cwd.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/aar/${stamp(ms)}/AAR.md`
 
-export const aarPrompt = (path: string, usedPct: number, estPct: number, resetIn: string, threads: number) =>
-  `${MARKER} The 5h usage limit is at ${usedPct.toFixed(0)}% and the work left is estimated at ` +
-  `${estPct.toFixed(0)}% total (${threads} thread(s) are writing AARs from this window), so it will not fit ` +
-  `before the reset (in ${resetIn}). Stop all other work now and write an AAR (after-action report) to ${path} ` +
+export const aarPrompt = (
+  path: string,
+  usedPct: number,
+  estPct: number,
+  resetIn: string,
+  threads: number,
+  manual = false,
+) =>
+  (manual
+    ? `${MARKER} The person is pausing this session (they are leaving, or a restart or network outage is coming) ` +
+      'and will resume later with /eta resume. '
+    : `${MARKER} The 5h usage limit is at ${usedPct.toFixed(0)}% and the work left is estimated at ` +
+      `${estPct.toFixed(0)}% total (${threads} thread(s) are writing AARs from this window), so it will not fit ` +
+      `before the reset (in ${resetIn}). `) +
+  `Stop all other work now and write an AAR (after-action report) to ${path} ` +
   `(the Write tool creates the folder: do not run mkdir; use exactly this absolute path). First read every agent-*.md checkpoint in ${aarDirOf(path)} ` +
   'and fold each into the AAR. List every background shell or agent still running (id, purpose, where its ' +
   'output lands) and every uncommitted change (git status) so nothing is lost. Keep it compact: your budget ' +
@@ -206,8 +227,9 @@ export const aarPrompt = (path: string, usedPct: number, estPct: number, resetIn
   'failing tests and open questions; Files and URLs to re-read first. Be dense, no filler. When the file is ' +
   'written reply with one line only: "AAR written" and the path. Do not start any other work.'
 
-export const resumePrompt = (path: string, cleared: boolean, hasCmds = false) =>
-  `${RESUME_MARKER} The usage window has reset. ` +
+export const resumePrompt = (path: string, cleared: boolean, hasCmds = false, manual = false) =>
+  `${RESUME_MARKER} ` +
+  (manual ? 'The person paused this session and is back now. ' : 'The usage window has reset. ') +
   (cleared ? 'This is a fresh session: you have no memory of the earlier one. ' : '') +
   (hasCmds
     ? 'The AAR opens with commands the user gave while the usage guard was active and that were held: reason ' +
