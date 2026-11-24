@@ -155,7 +155,7 @@ export function toolAllowed(
 
 export const denyText = (phase: Phase, isAgent: boolean, aarDir: string, id: string) =>
   phase === 'waiting'
-    ? 'Usage guard: paused until the 5h window resets (the person can run /eta override to lift it). ' +
+    ? 'Usage guard: paused until the 5h window resets (the person can run /eta resume to continue from the AAR now, or /eta override to lift it). ' +
       'Do nothing; reply with one word.'
     : isAgent
       ? `Usage guard: the 5h limit is nearly spent. Start nothing new. Write your checkpoint now with Write to ` +

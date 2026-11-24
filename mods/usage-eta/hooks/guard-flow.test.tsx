@@ -24,6 +24,8 @@ async function boot($: any, on: any, aarExists = true, cwd = '/work/proj') {
   on('session.messages', () => ({ value: [] }))
   const files: Record<string, string> = {}
   const state = { exists: aarExists }
+  const listing: { name: string; kind: string }[] = []
+  on('fs.list', () => ({ value: listing }))
   on('fs.exists', () => ({ value: state.exists }))
   on('fs.read', (_: any, e: any) => ({ value: files[e.path] ?? '# AAR\nNext steps: 1. build' }))
   on('fs.write', (_: any, e: any) => ((files[e.path] = e.text ?? e.content), { value: undefined }))
@@ -48,7 +50,7 @@ async function boot($: any, on: any, aarExists = true, cwd = '/work/proj') {
   await $.session.start({ cwd, surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'TaskCreate', subject: 'Huge refactor (~180m)', description: 'x' })
   CLK = clock
-  return { clock, store, seen, agents, files, state }
+  return { clock, store, seen, agents, files, state, listing }
 }
 
 const measure = ($: any, pct: number, resetInMin: number) =>
@@ -427,4 +429,64 @@ test('a resume never moves the transcript of the running session', { timeoutMs: 
   await clock.advance(200 * MIN)
   expect(seen.submits).toHaveLength(2)
   expect(seen.procs.some(a => a.includes('old-session-id'))).toBe(seen.commands.includes('clear'))
+})
+
+test('/eta resume continues from the AAR at once, after a manual reset or an account switch', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen } = await pause($, on)
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toContain('paused')
+  expect(seen.submits).toHaveLength(1)
+  const r: any = await $.command.run({ command: 'eta', args: 'resume' })
+  expect(r.text).toContain('resuming from the AAR')
+  await clock.advance(1000)
+  // the same resume prompt the timer would have sent, hours before the reset
+  expect(seen.submits).toHaveLength(2)
+  expect(seen.submits[1]).toContain(RESUME_MARKER)
+  expect(store['resume:/work/proj']).toBeUndefined()
+  expect(store['guard:trip']).toBeUndefined()
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+  // the old window's 96% reading is gone, so the next turn does not trip the guard again
+  await startTurn($, 't5', seen.submits[1])
+  await endTurn($, 't5')
+  expect(seen.submits).toHaveLength(2)
+  // nothing fires a second time when the original reset time comes
+  await clock.advance(200 * MIN)
+  expect(seen.submits).toHaveLength(2)
+})
+
+test('/eta resume sends the held prompts on top of the AAR, like the timer does', async ($, on) => {
+  const { clock, store, seen } = await pause($, on)
+  await $.prompt.submit({ text: 'ship it', origin: { kind: 'composer' }, wait: false } as any)
+  await $.command.run({ command: 'eta', args: 'resume' })
+  await clock.advance(1000)
+  expect(seen.submits.at(-1)).toContain(RESUME_MARKER)
+  expect(seen.submits.at(-1)).toContain('held')
+  expect(store['guard:cmds:/work/proj']).toBeUndefined()
+})
+
+test('/eta resume finds the newest AAR on disk after /eta override dropped the saved pause', async ($, on) => {
+  const { clock, seen, listing } = await pause($, on)
+  const aar = /(\/work\/proj\/\.claude\/aar\/[^ ]+\/AAR\.md)/.exec(seen.submits[0])![1]
+  await $.command.run({ command: 'eta', args: 'override' })
+  listing.push({ name: '2020-01-01T00-00-00', kind: 'dir' }, { name: aar.split('/').at(-2)!, kind: 'dir' }, { name: 'notes.txt', kind: 'file' })
+  const r: any = await $.command.run({ command: 'eta', args: 'resume' })
+  expect(r.text).toContain(aar)
+  await clock.advance(1000)
+  expect(seen.submits.at(-1)).toContain(RESUME_MARKER)
+  expect(seen.submits.at(-1)).toContain(aar)
+  expect(seen.submits.at(-1)).not.toContain('fresh session')
+})
+
+test('/eta resume with no AAR says so; mid-drain it releases the guard', async ($, on) => {
+  const { seen, state } = await boot($, on, false)
+  const none: any = await $.command.run({ command: 'eta', args: 'resume' })
+  expect(none.text).toContain('no AAR found')
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toContain('Usage guard')
+  const r: any = await $.command.run({ command: 'eta', args: 'resume' })
+  expect(r.text).toContain('released')
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+  await endTurn($, 't1')
+  expect(seen.submits).toEqual([])
+  expect(state.exists).toBe(false)
 })

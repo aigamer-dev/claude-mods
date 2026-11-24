@@ -481,6 +481,17 @@ const heldList = (cmds: readonly Cmd[]) =>
     .map((c, i) => `${i + 1}. ${c.text.trim().split(/\r?\n/)[0].slice(0, 200) ?? ""}`)
     .join('\n')
 
+/** The newest AAR on disk for this folder: what a resume uses when the saved pause is gone. */
+async function latestAar($: EngineInterface, cwd: string): Promise<string | undefined> {
+  const root = `${cwd.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/aar`
+  const dirs = await $.fs.list(root).catch(() => [])
+  for (const d of dirs.filter(x => x.kind === 'dir').map(x => x.name).sort().reverse()) {
+    const path = `${root}/${d}/AAR.md`
+    if (await $.fs.exists(path).catch(() => false)) return path
+  }
+  return undefined
+}
+
 /**
  * A fresh reading from a new window (a reset, or another account) ends a stale
  * guard: a pause with an AAR resumes from it now; a drain or AAR request stops.
@@ -506,7 +517,7 @@ export const register: Register = on => {
     S.todos = []
     await $.command.register({
       name: 'eta',
-      description: 'Show usage limits, tasks and the ETA estimator (/eta override releases the limit guard)',
+      description: 'Show usage limits, tasks and the ETA estimator (/eta override releases the limit guard, /eta resume continues from the AAR now)',
     })
     void $.ui.open({ id: PANE, title: 'Usage & ETA' })
     $.clock.every(30000, () => {
@@ -570,6 +581,46 @@ export const register: Register = on => {
             ? 'usage-eta: the limit guard is not active; running your prompt normally'
             : 'usage-eta: running your prompt with the limit guard lifted for this turn only',
       }
+    }
+    if (arg === 'resume') {
+      // Manual resume: the person reset the limits or switched account, so continue from the AAR now,
+      // exactly as the timer would have after the reset.
+      const cwd = await $.session.cwd()
+      const was = G.phase
+      const saved = (await $.store.get(storeKey(cwd)).catch(() => undefined)) as Pending | undefined
+      const own = G.pending ?? (saved?.aar ? saved : undefined)
+      const mine = !own && G.aar && (await $.fs.exists(G.aar).catch(() => false)) ? G.aar : undefined
+      const aar = own?.aar ?? mine ?? (await latestAar($, cwd))
+      const now = await $.clock.now()
+      // The old window's reading and trip no longer apply; the next response brings the new one.
+      G.bypass = undefined
+      G.readings = []
+      S.lastPct = undefined
+      await clearHold($).catch(() => undefined)
+      await $.store.delete(TRIP_KEY).catch(() => undefined)
+      await update($, usage, u => ({ ...u, fiveHour: undefined }))
+      if (!aar) {
+        G.phase = 'idle'
+        G.armed = false
+        G.pending = undefined
+        return {
+          text:
+            was === 'idle'
+              ? 'usage-eta: no AAR found for this folder, nothing to resume from'
+              : `usage-eta: the limit guard is released (was ${was}); no AAR was written yet, so there is nothing to resume from`,
+        }
+      }
+      G.pending = {
+        aar,
+        cwd,
+        resumeAt: now,
+        cleared: own?.cleared ?? false,
+        oldSession: own?.oldSession ?? '',
+      }
+      G.phase = 'waiting'
+      // Submitted from a timer (a prompt cannot be queued from inside a command); checkResume sends it.
+      $.clock.after(300, () => void checkResume($).catch(() => undefined))
+      return { text: `usage-eta: resuming from the AAR at ${aar} now (guard reset, the 5h window is read afresh)` }
     }
     if (arg === 'override') {
       const was = G.phase
@@ -769,7 +820,7 @@ export const register: Register = on => {
         </Box>
         {G.phase !== 'idle' && (
           <Text color="yellow">
-            Limit guard: {G.phase === 'draining' ? 'finishing running work' : G.phase === 'writing' ? 'writing the AAR' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()}`}
+            Limit guard: {G.phase === 'draining' ? 'finishing running work' : G.phase === 'writing' ? 'writing the AAR' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()} (/eta resume to go now)`}
           </Text>
         )}
         <Text dimColor>red used · white estimated for the tasks left · dim unused</Text>
