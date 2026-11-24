@@ -128,7 +128,7 @@ function isAarMkdir(cmd: string, aarDir: string): boolean {
     /^\s*mkdir\s+(?:-p\s+)?("[^"]+"|'[^']+'|\S+)\s*$/i.exec(cmd) ??
     /^\s*New-Item\s+(?:-ItemType\s+Directory\s+|-Force\s+)*(?:-Path\s+)?("[^"]+"|'[^']+'|\S+)(?:\s+-ItemType\s+Directory|\s+-Force)*\s*$/i.exec(cmd)
   if (!m) return false
-  const target = unquote(m[1])
+  const target = unquote(m[1] ?? "")
   return normPath(target) === normPath(aarDir) || insideDir(`${target}/x`, aarDir)
 }
 
@@ -206,9 +206,13 @@ export const aarPrompt = (path: string, usedPct: number, estPct: number, resetIn
   'failing tests and open questions; Files and URLs to re-read first. Be dense, no filler. When the file is ' +
   'written reply with one line only: "AAR written" and the path. Do not start any other work.'
 
-export const resumePrompt = (path: string, cleared: boolean) =>
+export const resumePrompt = (path: string, cleared: boolean, hasCmds = false) =>
   `${RESUME_MARKER} The usage window has reset. ` +
   (cleared ? 'This is a fresh session: you have no memory of the earlier one. ' : '') +
+  (hasCmds
+    ? 'The AAR opens with commands the user gave while the usage guard was active and that were held: reason ' +
+      'about them first, fold them into the plan, then carry them out. '
+    : '') +
   `Read the AAR at ${path} in full, restore its plan as your task list, and continue from "Next steps". ` +
   'Re-read only the files the AAR names. Do not redo finished work. If something in the AAR is ' +
   'ambiguous, check the repo state before asking.'
@@ -221,3 +225,78 @@ export const purgeScript =
 export const storeKey = (cwd: string) => `resume:${cwd}`
 
 export const aarDirOf = (aar: string) => aar.replace(/[\\/][^\\/]*$/, '')
+
+/** The mod's own name, as it shows in a prompt's origin when the mod submits one. */
+export const PLUGIN_NAME = 'usage-eta'
+
+/**
+ * A prompt the guard holds back: what the user typed after the guard tripped.
+ * `bypass` ones were run under /eta bypass (so already done, but after the AAR
+ * was written); the rest were never run.
+ */
+export type Cmd = { t: number; text: string; kind: 'held' | 'bypass' }
+export const cmdsKey = (cwd: string) => `guard:cmds:${cwd}`
+
+export const CMD_BEGIN = '<!-- usage-eta:commands -->'
+export const CMD_END = '<!-- /usage-eta:commands -->'
+
+/** A held prompt as one blockquoted list item, whatever lines it has. */
+const quote = (text: string) =>
+  text
+    .trim()
+    .split(/\r?\n/)
+    .map(l => `   > ${l}`)
+    .join('\n')
+
+/**
+ * The block placed at the very top of the AAR, written by the mod itself (no
+ * model call), so the resume reads the user's late commands before anything else.
+ */
+export function commandsBlock(cmds: readonly Cmd[]): string {
+  const held = cmds.filter(c => c.kind === 'held').length
+  const items = cmds
+    .map((c, i) => {
+      const when = new Date(c.t).toISOString().replace(/\.\d+Z$/, 'Z')
+      const note =
+        c.kind === 'held'
+          ? 'NOT RUN: held by the usage guard'
+          : 'ran under /eta bypass after this AAR was written: its effects may be missing from the sections below'
+      return `${i + 1}. [${when}] ${note}\n${quote(c.text)}`
+    })
+    .join('\n\n')
+  return (
+    `${CMD_BEGIN}\n` +
+    `# USER COMMANDS RECEIVED AFTER THE USAGE GUARD TRIPPED: ADDRESS FIRST\n\n` +
+    `${held} command(s) were held and never run; the user typed them verbatim while the 5h limit guard was ` +
+    'active. Saved by the usage-eta mod, not written by the previous session. Before the plan below, read ' +
+    'each one, reason about how it changes, adds to or reorders the "Next steps", say so in your first ' +
+    'reply, then carry them out.\n\n' +
+    `${items}\n` +
+    `${CMD_END}\n\n`
+  )
+}
+
+/** The AAR text with the commands block on top (an earlier block replaced); unchanged for none. */
+export function withCommands(aar: string, cmds: readonly Cmd[]): string {
+  if (cmds.length === 0) return aar
+  const a = aar.indexOf(CMD_BEGIN)
+  const b = aar.indexOf(CMD_END)
+  const rest = a >= 0 && b > a ? aar.slice(0, a) + aar.slice(b + CMD_END.length).replace(/^\s*\n/, '') : aar
+  return commandsBlock(cmds) + rest
+}
+
+/** The people's own prompts (typed, bridged, channelled), not another plugin's or a notification. */
+const USER_KINDS = new Set(['composer', 'bridge', 'channel', 'slack-ping', 'unclassified'])
+
+/** True when a prompt is one the guard must hold: the user's, and not this mod's own submission. */
+export function isHeldPrompt(
+  e: { text: string; origin?: { kind: string; name?: string }; command?: unknown; isMeta?: boolean },
+  bypassText?: string,
+): boolean {
+  if (e.command || e.isMeta) return false
+  if (e.text.includes(MARKER) || e.text.includes(RESUME_MARKER)) return false
+  if (bypassText !== undefined && e.text === bypassText) return false
+  const k = e.origin?.kind
+  if (k === 'plugin') return false
+  return k === undefined || USER_KINDS.has(k)
+}

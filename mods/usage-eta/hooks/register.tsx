@@ -31,8 +31,10 @@ import {
   aarDirOf,
   aarPath,
   aarPrompt,
+  cmdsKey,
   countThreads,
   denyText,
+  isHeldPrompt,
   liveKey,
   planResume,
   purgeScript,
@@ -42,8 +44,9 @@ import {
   thresholds,
   toolAllowed,
   windowFresh,
+  withCommands,
 } from './guard'
-import type { Hold, Live, Pending, Phase, Trip } from './guard'
+import type { Cmd, Hold, Live, Pending, Phase, Trip } from './guard'
 import type { Model } from './estimator'
 
 const PANE = 'usage-eta'
@@ -96,6 +99,8 @@ const G = {
   pending: undefined as Pending | undefined,
   /** The guard stays off until this time; mirrored in the store (HOLD_KEY) for every session. */
   holdUntil: 0,
+  /** Set by /eta bypass: the one prompt (and its turn) that runs with the guard lifted. */
+  bypass: undefined as { text: string; at: number; turnId?: string } | undefined,
   /** Recent five-hour readings, for the burn rate. */
   readings: [] as { t: number; pct: number }[],
 }
@@ -150,6 +155,38 @@ async function setHold($: EngineInterface, until: number) {
 async function clearHold($: EngineInterface) {
   G.holdUntil = 0
   await $.store.delete(HOLD_KEY)
+}
+
+/** The prompts held (or bypassed) since the guard tripped in this folder. */
+async function loadCmds($: EngineInterface): Promise<Cmd[]> {
+  const v = (await $.store.get(cmdsKey(await $.session.cwd())).catch(() => undefined)) as Cmd[] | undefined
+  return Array.isArray(v) ? v : []
+}
+
+/**
+ * Writes the held prompts onto the top of the AAR, statically (no model call):
+ * the file is read, any earlier block replaced, the new one prepended. A no-op
+ * until the AAR exists; finishAar and the resume call it again.
+ */
+async function flushCmds($: EngineInterface) {
+  const path = G.pending?.aar ?? G.aar
+  if (!path) return
+  const cmds = await loadCmds($)
+  if (cmds.length === 0 || !(await $.fs.exists(path).catch(() => false))) return
+  try {
+    const text = await $.fs.read(path)
+    await $.fs.write(path, withCommands(text, cmds))
+  } catch {
+    $.ui.toast('Could not add the held prompts to the AAR; they stay saved and are retried')
+  }
+}
+
+async function addCmd($: EngineInterface, text: string, kind: Cmd['kind']) {
+  const cwd = await $.session.cwd()
+  const cmds = await loadCmds($)
+  cmds.push({ t: await $.clock.now(), text, kind })
+  await $.store.set(cmdsKey(cwd), cmds)
+  await flushCmds($)
 }
 
 /** The time the guard is held until: this session's own, or one another session left in the store. */
@@ -330,12 +367,13 @@ async function advanceDrain($: EngineInterface) {
   const now = await $.clock.now()
   const lt = await liveThreads($)
   const late = now - G.drainAt > DRAIN_MAX_MS
-  if (G.running && late && G.turnId) {
+  if (G.running && late && G.turnId && !G.bypass?.turnId) {
     // Last resort: a turn that never ends. Its work was denied new tools long ago.
     await $.turn.abort({ turnId: G.turnId } as never).catch(() => undefined)
     return
   }
   if (G.running || (lt.running > 0 && !late)) return
+  if (G.bypass) return // a bypassed prompt is still to run: the AAR comes after it
   G.phase = 'writing'
   G.armed = false
   const resetIn = fmtMin(Math.max(0, (Date.parse(G.resetsAt ?? '') - now) / 60000) || 300)
@@ -362,6 +400,7 @@ async function finishAar($: EngineInterface) {
     )
     return
   }
+  await flushCmds($) // prompts held while the AAR was being written go on top of it now
   const pct = (await read($, usage)).fiveHour?.pct
   if (pct !== undefined && pct > G.used) {
     const per = Math.min(8, Math.max(0.2, (pct - G.used) / G.threads))
@@ -400,10 +439,15 @@ async function checkResume($: EngineInterface) {
   const now = await $.clock.now()
   const p = G.pending
   if (now < p.resumeAt) return
+  await flushCmds($)
+  const cmds = await loadCmds($)
   G.phase = 'idle'
   G.pending = undefined
   await $.store.delete(storeKey(p.cwd))
-  void $.prompt.submit({ text: resumePrompt(p.aar, p.cleared) }).catch(() => undefined)
+  await $.store.delete(cmdsKey(p.cwd))
+  void $.prompt
+    .submit({ text: resumePrompt(p.aar, p.cleared, cmds.some(c => c.kind === 'held')) })
+    .catch(() => undefined)
   // Never move the transcript of the session that is running now (e.g. one resumed with --resume).
   if (p.cleared && p.oldSession && p.oldSession !== (await $.session.id())) {
     // Old sessions are moved to ~/archive/_review/<date>/ (manifest), never deleted outright.
@@ -419,10 +463,23 @@ async function release($: EngineInterface, why: string) {
   G.phase = 'idle'
   G.armed = false
   G.pending = undefined
+  G.bypass = undefined
   await $.store.delete(storeKey(cwd))
   await $.store.delete(TRIP_KEY)
-  $.ui.toast(`Limit guard released: ${why}`)
+  const held = (await loadCmds($)).filter(c => c.kind === 'held')
+  await $.store.delete(cmdsKey(cwd))
+  $.ui.toast(
+    `Limit guard released: ${why}` +
+      (held.length ? `. ${held.length} held prompt(s) were not run; send them again` : ''),
+  )
 }
+
+/** The held prompts as text, to hand back to the user when the guard is released. */
+const heldList = (cmds: readonly Cmd[]) =>
+  cmds
+    .filter(c => c.kind === 'held')
+    .map((c, i) => `${i + 1}. ${c.text.trim().split(/\r?\n/)[0].slice(0, 200) ?? ""}`)
+    .join('\n')
 
 /**
  * A fresh reading from a new window (a reset, or another account) ends a stale
@@ -456,6 +513,8 @@ export const register: Register = on => {
       $.ui.invalidate('ui.render')
       void (async () => {
         await refreshModel($)
+        // A bypassed prompt whose turn never started (submit lost) must not hold the guard forever.
+        if (G.bypass && G.bypass.turnId === undefined && (await $.clock.now()) - G.bypass.at > 120_000) G.bypass = undefined
         await heartbeat($)
         await checkResume($)
         await advanceDrain($)
@@ -477,6 +536,7 @@ export const register: Register = on => {
       G.turnId = e.turnId
       G.running = true
       if (G.phase === 'writing' && e.text.includes(MARKER)) G.armed = true
+      if (G.bypass && G.bypass.turnId === undefined && e.text.includes(G.bypass.text)) G.bypass.turnId = e.turnId
     }
     return next(e)
   })
@@ -487,8 +547,33 @@ export const register: Register = on => {
       await clearHold($)
       return { text: 'usage-eta: the limit guard is on again' }
     }
+    if (/^bypass\b/.test(arg)) {
+      const prompt = e.args.trim().replace(/^bypass\s*/i, '').trim()
+      if (!prompt) {
+        return { text: 'usage-eta: usage is /eta bypass <your prompt>: it runs that prompt once with the limit guard lifted' }
+      }
+      const now = await $.clock.now()
+      if (G.phase !== 'idle') {
+        G.bypass = { text: prompt, at: now }
+        await addCmd($, prompt, 'bypass')
+      }
+      // Submitted from a timer (a prompt cannot be queued from inside a command), as the user's own words.
+      $.clock.after(300, () => {
+        void $.prompt.submit({ text: prompt, asUser: true }).catch(() => {
+          G.bypass = undefined
+          $.ui.toast('Could not submit the bypassed prompt')
+        })
+      })
+      return {
+        text:
+          G.phase === 'idle'
+            ? 'usage-eta: the limit guard is not active; running your prompt normally'
+            : 'usage-eta: running your prompt with the limit guard lifted for this turn only',
+      }
+    }
     if (arg === 'override') {
       const was = G.phase
+      const heldNow = heldList(await loadCmds($))
       const resetsAt = Date.parse((await read($, usage)).fiveHour?.resetsAt ?? '')
       const now = await $.clock.now()
       // The hold lives in the store, so every session (and a session a /clear starts) honours it.
@@ -498,11 +583,12 @@ export const register: Register = on => {
       G.pending = undefined
       await setHold($, Number.isFinite(resetsAt) && resetsAt > now ? resetsAt : now + 5 * 3600_000).catch(() => undefined)
       await release($, 'overridden with /eta override').catch(() => undefined)
+      const base =
+        was === 'idle'
+          ? 'usage-eta: the limit guard is held off until the 5h window resets (/eta guard on turns it back on)'
+          : `usage-eta: limit guard released (was ${was}); tools are allowed again until the 5h window resets`
       return {
-        text:
-          was === 'idle'
-            ? 'usage-eta: the limit guard is held off until the 5h window resets (/eta guard on turns it back on)'
-            : `usage-eta: limit guard released (was ${was}); tools are allowed again until the 5h window resets`,
+        text: heldNow ? `${base}\nThese prompts were held and not run, send them again if you want them:\n${heldNow}` : base,
       }
     }
     await $.ui.open({ id: PANE, title: 'Usage & ETA' })
@@ -515,13 +601,23 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // While the guard is active the user's prompts are not sent to the model (no tokens spent on a
+    // turn whose tools are all refused): each is saved verbatim and written onto the top of the AAR.
+    if (G.phase !== 'idle' && isHeldPrompt(e, G.bypass?.text)) {
+      await addCmd($, e.text, 'held')
+      return {
+        drop:
+          'Usage guard active: this message was saved and will be placed at the top of the AAR, to be ' +
+          'handled first after the reset. Use /eta bypass <message> to run it now, or /eta override to lift the guard.',
+      }
+    }
     S.mark = { t: await $.clock.now(), tok: (await read($, usage)).tokens }
     return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool)
-    if (G.phase !== 'idle') {
+    if (G.phase !== 'idle' && G.bypass?.turnId === undefined) {
       const dir = aarDirOf(G.aar || G.pending?.aar || '')
       const agentId = (e as { agentId?: string }).agentId
       if (!toolAllowed(G.phase, tool, e as unknown as { file_path?: string; command?: string }, dir)) {
@@ -586,6 +682,7 @@ export const register: Register = on => {
     await refreshStatus($)
     if (isMain) {
       G.running = false
+      if (G.bypass?.turnId !== undefined && G.bypass.turnId === e.turnId) G.bypass = undefined
       // `armed` can be missed (a rewritten prompt); a written AAR file settles it too.
       if (G.phase === 'writing' && (G.armed || (await $.fs.exists(G.aar).catch(() => false)))) await finishAar($)
       else if (G.phase === 'draining') await advanceDrain($)

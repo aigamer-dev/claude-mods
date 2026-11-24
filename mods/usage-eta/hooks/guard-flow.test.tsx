@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { DRAIN_MAX_MS, MARKER, RESUME_MARKER } from './guard'
+import { CMD_BEGIN, DRAIN_MAX_MS, MARKER, RESUME_MARKER } from './guard'
 
 const T0 = 1_700_000_000_000
 const MIN = 60_000
@@ -22,7 +22,11 @@ async function boot($: any, on: any, aarExists = true, cwd = '/work/proj') {
   let sid = 'old-session-id'
   on('session.id', () => ({ value: sid }))
   on('session.messages', () => ({ value: [] }))
-  on('fs.exists', () => ({ value: aarExists }))
+  const files: Record<string, string> = {}
+  const state = { exists: aarExists }
+  on('fs.exists', () => ({ value: state.exists }))
+  on('fs.read', (_: any, e: any) => ({ value: files[e.path] ?? '# AAR\nNext steps: 1. build' }))
+  on('fs.write', (_: any, e: any) => ((files[e.path] = e.text ?? e.content), { value: undefined }))
   on('turn.abort', (_: any, e: any) => (seen.abort.push(e.turnId), { value: undefined }))
   on('prompt.submit', (_: any, e: any) => (seen.submits.push(e.text), { text: e.text } as never))
   on('command.run', (_: any, e: any) => {
@@ -44,7 +48,7 @@ async function boot($: any, on: any, aarExists = true, cwd = '/work/proj') {
   await $.session.start({ cwd, surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'TaskCreate', subject: 'Huge refactor (~180m)', description: 'x' })
   CLK = clock
-  return { clock, store, seen, agents }
+  return { clock, store, seen, agents, files, state }
 }
 
 const measure = ($: any, pct: number, resetInMin: number) =>
@@ -313,6 +317,102 @@ test('rate learning keeps the task samples other sessions saved', { timeoutMs: 6
   expect(m.nRate).toBe(2)
   expect(m.n).toBe(7)
   expect(m.nAll).toBe(9)
+})
+
+/** Gets the guard into its paused (waiting) phase with the AAR written. */
+async function pause($: any, on: any, cwd = '/work/proj') {
+  const w = await boot($, on, true, cwd)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  await endTurn($, 't1')
+  await startTurn($, 't2', w.seen.submits[0])
+  await endTurn($, 't2')
+  await w.clock.advance(2500)
+  return w
+}
+
+test('a prompt typed while the guard is active is held, saved and put on top of the AAR (no model call)', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen, files } = await pause($, on)
+  const before = seen.submits.length
+  const r: any = await $.prompt.submit({ text: 'also add retry logic\nand a test', origin: { kind: 'composer' }, wait: false } as any)
+  expect(r.drop).toContain('AAR')
+  expect(seen.submits.length).toBe(before) // nothing reached the model
+  const cmds = store['guard:cmds:/work/proj'] as any[]
+  expect(cmds).toHaveLength(1)
+  expect(cmds[0].text).toBe('also add retry logic\nand a test')
+  // statically written on top of the AAR, the model's text kept below
+  const aar = Object.keys(files)[0]
+  const text = files[aar]
+  expect(text.startsWith(CMD_BEGIN)).toBe(true)
+  expect(text).toContain('> also add retry logic')
+  expect(text).toContain('> and a test')
+  expect(text).toContain('Next steps: 1. build')
+  // a second one replaces the block rather than stacking another
+  await $.prompt.submit({ text: 'and update the docs', origin: { kind: 'composer' }, wait: false } as any)
+  expect(files[aar].split(CMD_BEGIN).length).toBe(2)
+  expect(files[aar]).toContain('2. [')
+  // the resume tells the model to take them first, and the ledger is cleared
+  await clock.advance(200 * MIN)
+  expect(seen.submits.at(-1)).toContain(RESUME_MARKER)
+  expect(seen.submits.at(-1)).toContain('held')
+  expect(store['guard:cmds:/work/proj']).toBeUndefined()
+})
+
+test('prompts held before the AAR exists are added to it when it is written', async ($, on) => {
+  const { store, seen, files, state } = await boot($, on, false)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  // draining: the AAR does not exist yet
+  const r: any = await $.prompt.submit({ text: 'do the thing', origin: { kind: 'composer' }, wait: true } as any)
+  expect(r.drop).toBeDefined()
+  expect(Object.keys(files)).toEqual([])
+  await endTurn($, 't1')
+  await startTurn($, 't2', seen.submits[0])
+  state.exists = true // the model wrote the AAR during its turn
+  await endTurn($, 't2')
+  const aar = Object.keys(files)[0]
+  expect(files[aar]).toContain('> do the thing')
+  expect(aar.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')).toBe((store['resume:/work/proj'] as any).aar)
+})
+
+test('the guard does not hold its own prompts or other plugins', async ($, on) => {
+  const { seen } = await boot($, on)
+  await startTurn($, 't1', 'keep working')
+  await measure($, 96, 180)
+  const other: any = await $.prompt.submit({ text: 'notification', origin: { kind: 'task-notification' }, wait: false } as any)
+  expect(other.drop).toBeUndefined()
+  await endTurn($, 't1')
+  expect(seen.submits.some(t => t.includes(MARKER))).toBe(true) // the AAR request itself went through
+})
+
+test('/eta bypass runs one prompt with the guard lifted, then the guard is back', { timeoutMs: 60_000 }, async ($, on) => {
+  const { clock, store, seen, files } = await pause($, on)
+  const denied: any = await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  expect(denied.deny).toContain('paused')
+  const none: any = await $.command.run({ command: 'eta', args: 'bypass' })
+  expect(none.text).toContain('usage is')
+  const r: any = await $.command.run({ command: 'eta', args: 'bypass fix the build' })
+  expect(r.text).toContain('lifted')
+  await clock.advance(1000)
+  expect(seen.submits.at(-1)).toBe('fix the build')
+  await startTurn($, 't9', 'fix the build')
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toBeUndefined()
+  expect(((await $.tool.call({ tool: 'Write', file_path: '/work/proj/src/a.ts', content: 'x' })) as any).deny).toBeUndefined()
+  await endTurn($, 't9')
+  expect(((await $.tool.call({ tool: 'Bash', command: 'npm test' })) as any).deny).toContain('paused')
+  // the bypassed prompt is noted on the AAR as run, not as pending
+  const aar = Object.keys(files)[0]
+  expect(files[aar]).toContain('ran under /eta bypass')
+  expect(files[aar]).toContain('> fix the build')
+  expect(store['resume:/work/proj']).toBeDefined() // still paused for the reset
+})
+
+test('/eta override gives back the prompts that were held', async ($, on) => {
+  const { store } = await pause($, on)
+  await $.prompt.submit({ text: 'ship it', origin: { kind: 'composer' }, wait: false } as any)
+  const r: any = await $.command.run({ command: 'eta', args: 'override' })
+  expect(r.text).toContain('ship it')
+  expect(store['guard:cmds:/work/proj']).toBeUndefined()
 })
 
 test('a resume never moves the transcript of the running session', { timeoutMs: 60_000 }, async ($, on) => {
