@@ -59,8 +59,10 @@ import {
 } from './guard'
 import type { Cmd, Hold, Live, Pending, Phase, Trip } from './guard'
 import type { Model } from './estimator'
-import { abortOrder, live as liveAgents, merge as mergeAgents, newCycle, noteDenied, noteEnd, noteSeen, noteSpawn } from './agents'
+import { abortOrder, agentRows, live as liveAgents, merge as mergeAgents, newCycle, noteDenied, noteEnd, noteSeen, noteSpawn } from './agents'
 import type { Tree } from './agents'
+import { buildView, statusLine } from './view'
+import type { ViewModel } from './view'
 
 const PANE = 'runway'
 const tasks = atom({ plugin: 'runway', key: 'tasks' } as const, [], {
@@ -312,16 +314,58 @@ async function holdUntil($: EngineInterface): Promise<number> {
   return Math.max(G.holdUntil, typeof h?.until === 'number' ? h.until : 0)
 }
 
-async function summary($: EngineInterface) {
+/** Everything the pane and the status line show, as plain data (the layout itself is in view.ts). */
+async function snapshot($: EngineInterface, cols: number, withAgentList = false): Promise<ViewModel> {
   const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
   const now = await $.clock.now()
   const f = forecast(t, g, u, S.model, now, turnStart())
-  const five = u.fiveHour ? `5h ${u.fiveHour.pct.toFixed(0)}%` : '5h --'
-  const wk = u.week ? ` wk ${u.week.pct.toFixed(0)}%` : ''
-  const left = f.pending > 0 || (g && !g.doneAt)
-  return left
-    ? `${five}${wk} · ETA ${fmtMin(f.remainingMin)} · ~${fmtTok(f.tokens)} tok · ${f.fits ? 'fits' : "WON'T FIT"}`
-    : `${five}${wk}`
+  const hasWork = f.pending > 0 || (g && !g.doneAt)
+  // Only the pane asks the list: it names the agents' task descriptions. The status line is refreshed from
+  // hooks of running turns and must not wait on it.
+  if (withAgentList) {
+    const listed = await $.agent.list().then(x => x, () => undefined)
+    if (listed) mergeAgents(AG, listed, now)
+  }
+  // A reading whose window has already reset is stale: shown as unknown until the next response.
+  const fresh = (l: { pct: number; resetsAt?: string } | undefined) => (l?.resetsAt && Date.parse(l.resetsAt) <= now ? undefined : l)
+  const guard: ViewModel['guard'] =
+    G.phase === 'idle'
+      ? undefined
+      : { phase: G.phase, manual: G.manual, resumeAt: G.manual ? undefined : G.pending?.resumeAt, since: G.drainAt || undefined }
+  const m = S.model
+  return {
+    cols,
+    now,
+    five: fresh(u.fiveHour),
+    week: fresh(u.week),
+    estPct: hasWork ? f.pctNeeded : 0,
+    guard,
+    agents: agentRows(AG, now),
+    tasks: t.map(x => ({
+      text: x.text,
+      status: x.status,
+      estMin: estTaskMin(x, m),
+      eta: x.eta,
+      spentMin: x.startedAt !== undefined ? ((x.doneAt ?? now) - x.startedAt) / 60000 : undefined,
+    })),
+    egm: g
+      ? {
+          skill: g.skill,
+          doneMin: g.doneAt ? (g.doneAt - g.startedAt) / 60000 : undefined,
+          steps: g.steps.map(s => ({ type: s.type, label: s.label, done: !!s.doneAt, min: ((s.doneAt ?? now) - s.startedAt) / 60000 })),
+          left: expectedAgents(g, m).map(type => ({ type, estMin: agentMinOf(m, g.skill, type) })),
+        }
+      : undefined,
+    forecast: hasWork
+      ? { remainingMin: f.remainingMin, lowMin: f.lowMin, highMin: f.highMin, tokens: f.tokens, pctNeeded: f.pctNeeded, fits: f.fits, reason: f.reason }
+      : undefined,
+    session: { tokens: u.tokens, usd: u.usd },
+    model: { n: m.n, correction: correction(m), mape: m.mape, tokPerMin: m.tokPerMin, pctPerMtok: m.pctPerMtok, learning: f.isLearning, nAll: m.nAll, nTurn: m.nTurn, nAgent: m.nAgent, nRate: m.nRate },
+  }
+}
+
+async function summary($: EngineInterface) {
+  return statusLine(await snapshot($, 80))
 }
 
 async function refreshStatus($: EngineInterface) {
@@ -1208,120 +1252,19 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     await ensure($)
-    const [t, g, u] = [await read($, tasks), await read($, egm), await read($, usage)]
-    const now = await $.clock.now()
-    const f = forecast(t, g, u, S.model, now, turnStart())
-    const reset = (l?: { resetsAt?: string }) =>
-      l?.resetsAt ? ` · resets in ${fmtMin((Date.parse(l.resetsAt) - now) / 60000)}` : ''
-    const doneCount = t.filter(x => x.status === 'completed').length
-    const icon = (s: Task['status']) => (s === 'completed' ? '✔' : s === 'in_progress' ? '▶' : '○')
-    const left = expectedAgents(g, S.model)
-    const hasWork = f.pending > 0 || (g && !g.doneAt)
-    const five = barParts(u.fiveHour?.pct ?? 0, hasWork ? f.pctNeeded : 0)
-    const wk = barParts(u.week?.pct ?? 0, 0)
-
+    const cols = Math.max(24, (e as unknown as { props?: { bodyColumns?: number } }).props?.bodyColumns ?? 60)
+    const lines = buildView(await snapshot($, cols, true))
     return (
       <Box flexDirection="column">
-        <Text bold>Limits</Text>
-        <Box flexDirection="row">
-          <Text>5h   </Text>
-          <Text color="red">{'█'.repeat(five.used)}</Text>
-          <Text color="white">{'█'.repeat(five.est)}</Text>
-          <Text dimColor>{'░'.repeat(five.free)}</Text>
-          <Text>
-            {' '}
-            {u.fiveHour ? `${u.fiveHour.pct.toFixed(0)}%` : '--'}
-            {f.pending > 0 || (g && !g.doneAt) ? ` +${f.pctNeeded.toFixed(0)}% est` : ''}
-            {reset(u.fiveHour)}
-          </Text>
-        </Box>
-        <Box flexDirection="row">
-          <Text>Week </Text>
-          <Text color="red">{'█'.repeat(wk.used)}</Text>
-          <Text dimColor>{'░'.repeat(wk.free)}</Text>
-          <Text>
-            {' '}
-            {u.week ? `${u.week.pct.toFixed(0)}%` : '--'}
-            {reset(u.week)}
-          </Text>
-        </Box>
-        {G.phase !== 'idle' && (
-          <Text color="yellow">
-            Limit guard: {G.phase === 'draining' ? 'finishing running work' : G.phase === 'writing' ? 'writing the AAR' : G.manual ? 'paused by you (/eta resume to continue)' : `paused, resumes ${G.pending?.cleared ? 'after /clear ' : ''}at ${new Date(G.pending?.resumeAt ?? now).toLocaleTimeString()} (/eta resume to go now)`}
-          </Text>
-        )}
-        <Text dimColor>red used · white estimated for the tasks left · dim unused</Text>
-        <Text dimColor>
-          Session: {fmtTok(u.tokens)} effective tokens · ${u.usd.toFixed(2)}
-        </Text>
-
-        <Text bold> </Text>
-        <Text bold>
-          Tasks {doneCount}/{t.length}
-        </Text>
-        {t.length === 0 && <Text dimColor>No todo list yet.</Text>}
-        {t.map(x => {
-          const est = estTaskMin(x, S.model)
-          const spent =
-            x.startedAt !== undefined ? ((x.doneAt ?? now) - x.startedAt) / 60000 : undefined
-          return (
-            <Text dimColor={x.status === 'completed'}>
-              {icon(x.status)} {x.text}
-              {x.status === 'completed'
-                ? ` · ${fmtMin(spent ?? 0)}${x.eta ? ` (llm ${fmtMin(x.eta)})` : ''}`
-                : ` · est ${fmtMin(est)}${x.eta ? ` (llm ${fmtMin(x.eta)})` : ''}`}
-              {x.status === 'in_progress' && spent !== undefined ? ` · ${fmtMin(spent)} in` : ''}
-            </Text>
-          )
-        })}
-
-        {g && (
-          <Box flexDirection="column">
-            <Text bold> </Text>
-            <Text bold>
-              EGM · {g.skill} {g.doneAt ? `· done in ${fmtMin((g.doneAt - g.startedAt) / 60000)}` : ''}
-            </Text>
-            {g.steps.map(s => (
-              <Text dimColor={!!s.doneAt}>
-                {s.doneAt ? '✔' : '▶'} {s.type.replace('egm:', '')}
-                {s.label ? ` · ${s.label}` : ''} · {fmtMin(((s.doneAt ?? now) - s.startedAt) / 60000)}
-              </Text>
-            ))}
-            {left.map(type => (
-              <Text dimColor>
-                ○ {type.replace('egm:', '')} · est {fmtMin(agentMinOf(S.model, g.skill, type))}
+        {lines.map((line, i) => (
+          <Box key={i} flexDirection="row">
+            {line.map((sg, j) => (
+              <Text key={j} bold={sg.bold} dimColor={sg.dim} color={sg.color}>
+                {sg.t}
               </Text>
             ))}
           </Box>
-        )}
-
-        <Text bold> </Text>
-        <Text bold>Forecast</Text>
-        {f.pending === 0 && !(g && !g.doneAt) ? (
-          <Text dimColor>Nothing left to estimate.</Text>
-        ) : (
-          <Box flexDirection="column">
-            <Text>
-              ETA {fmtMin(f.remainingMin)} (range {fmtMin(f.lowMin)}–{fmtMin(f.highMin)})
-            </Text>
-            <Text>
-              Tokens ~{fmtTok(f.tokens)} · ~{f.pctNeeded.toFixed(0)}% of the 5h limit
-            </Text>
-            <Text color={f.fits ? 'green' : 'red'}>
-              {f.fits ? '✔ Fits' : '✘ Will not fit'}: {f.reason}
-            </Text>
-          </Box>
-        )}
-
-        <Text bold> </Text>
-        <Text dimColor>
-          Model: {S.model.n} ETA samples · llm ×{correction(S.model).toFixed(2)} · error ±
-          {(S.model.mape * 100).toFixed(0)}% · {fmtTok(S.model.tokPerMin)} tok/min · {S.model.pctPerMtok.toFixed(1)}%/Mtok
-          {f.isLearning ? ' · still learning' : ''}
-        </Text>
-        <Text dimColor>
-          Learned from: {S.model.nAll} tasks · {S.model.nTurn} turns · {S.model.nAgent} agent runs · {S.model.nRate} rate readings
-        </Text>
+        ))}
       </Box>
     )
   })

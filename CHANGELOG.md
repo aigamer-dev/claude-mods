@@ -15,6 +15,14 @@ All notable changes to this collection are recorded here. The format follows [Ke
 
 ## runway (formerly usage-eta)
 
+### [0.4.0] - 2026-11-28
+#### Changed
+- **A redesigned pane.** The layout follows the pane's width: both limit bars share one width, colour from green to yellow to red as a limit fills, and show the estimate for the tasks left and a reset countdown. A narrow pane drops the secondary detail. Every line is cut to the pane, so nothing wraps.
+- **A guard banner** says what the guard is doing (finishing work, writing the AAR, paused) with a countdown to the resume.
+- **An agent tree** shows every running agent with its nesting depth, type, description and running time.
+- **A tidier task list**: an overall progress bar, active tasks first and finished ones last with the earlier ones folded away, and each finished task shown over or under its estimate.
+- **A better status line** with a mini bar, the reset countdown, the week, and a fits / won't-fit verdict, plus a marker while the guard is active.
+
 ### [0.3.0] - 2026-11-28
 #### Changed
 - **usage-eta is now called runway.** Install it with `runway@claude-armory`; the setup skill is `/runway-setup`. The `/eta` command is unchanged.

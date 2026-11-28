@@ -17,11 +17,13 @@
 
 | | |
 |---|---|
-| **Live limits** | The 5-hour and weekly limits in a pane you open with `/eta`. |
-| **Task tracker** | Your task list, including EGM subagent steps, with progress. |
+| **Live limits** | The 5-hour and weekly limits in a pane you open with `/eta`: bars that follow the pane's width and turn yellow then red as a limit fills, with the estimate for your tasks and a countdown to the reset. |
+| **Task tracker** | Your task list with a progress bar, active tasks first, each finished task shown over or under its estimate, and EGM subagent steps. |
+| **Agent tree** | Every running agent at any depth, with its type, description and running time. |
 | **Forecast** | ETA, token estimate and a verdict on whether the work fits in the 5-hour window. |
 | **Self-calibrating** | The estimator learns from finished tasks, turns and agent runs. |
-| **Limit guard** | Checkpoints, writes an after-action report (AAR), pauses and resumes after the reset. |
+| **Limit guard** | Checkpoints, writes an after-action report (AAR), pauses and resumes after the reset. A banner shows what it is doing and counts down to the resume. |
+| **Status line** | One line under the prompt: a mini bar for the 5h limit, the reset countdown, the week, and an ETA with a fits / won't-fit verdict. |
 | **Held prompts** | Prompts you type while the guard is active are saved, not lost, and handled first on resume. |
 
 ## Install
@@ -98,6 +100,7 @@ python3 mods/runway/skills/runway-setup/test_setup.py
 |---|---|
 | `hooks/register.tsx` | The mod: pane, commands and the guard's hooks |
 | `hooks/guard.ts` | Pure guard logic: thresholds, the read-only allowlist, AAR paths, completions |
-| `hooks/agents.ts` | The agent tree used to track and stop agents at any depth |
+| `hooks/agents.ts` | The agent tree used to track and stop agents at any depth, and to draw it |
+| `hooks/view.ts` | The pane and status line as plain data, laid out for the pane's width |
 | `hooks/estimator.ts` | The self-calibrating estimator |
 | `skills/runway-setup/` | The `/runway-setup` skill and its script |

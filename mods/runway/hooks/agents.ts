@@ -22,6 +22,10 @@ export type AgentRec = {
   type?: string
   /** The turn the agent's loop runs now, for `$.turn.abort`. */
   turnId?: string
+  /** First time anything showed it, for how long it has run. */
+  since: number
+  /** The Agent call's own short description of the task, when the list gave one. */
+  label?: string
   /** Last time an event or a list entry showed it alive. */
   seen: number
   ended?: boolean
@@ -36,7 +40,7 @@ export type AgentRec = {
 export type Tree = Map<string, AgentRec>
 
 /** What of `$.agent.list()`'s entry the tree reads. */
-export type Listed = { id: string; parentId?: string; type?: string; status: string }
+export type Listed = { id: string; parentId?: string; type?: string; description?: string; status: string }
 
 const ACTIVE = new Set(['pending', 'running', 'waiting'])
 
@@ -44,7 +48,7 @@ const ACTIVE = new Set(['pending', 'running', 'waiting'])
 function rec(t: Tree, id: string, now: number): AgentRec {
   let r = t.get(id)
   if (!r) {
-    r = { id, seen: now, denied: 0 }
+    r = { id, since: now, seen: now, denied: 0 }
     t.set(id, r)
   }
   return r
@@ -99,6 +103,7 @@ export function merge(t: Tree, list: readonly Listed[], now: number) {
     r.listed = true
     r.parent = a.parentId ?? r.parent
     r.type = a.type ?? r.type
+    r.label = a.description || r.label
     if (ACTIVE.has(a.status)) {
       r.seen = now
       r.ended = false
@@ -165,4 +170,35 @@ export function prune(t: Tree, now: number) {
   for (const [id, r] of t) {
     if (r.ended || now - r.seen > STALE_MS) t.delete(id)
   }
+}
+
+/** What the pane shows of an agent. */
+export type AgentView = { id: string; type: string; label?: string; depth: number; since: number }
+
+/**
+ * The live agents as the pane draws them: parents before their children, children by start time.
+ * An agent whose parent is not live (ended, or never seen) is drawn at the top level.
+ */
+export function agentRows(t: Tree, now: number): AgentView[] {
+  const liveRecs = live(t, now)
+  const ids = new Set(liveRecs.map(r => r.id))
+  const kids = new Map<string, AgentRec[]>()
+  const roots: AgentRec[] = []
+  for (const r of liveRecs) {
+    if (r.parent && ids.has(r.parent) && r.parent !== r.id) kids.set(r.parent, [...(kids.get(r.parent) ?? []), r])
+    else roots.push(r)
+  }
+  const byStart = (a: AgentRec, b: AgentRec) => a.since - b.since
+  const out: AgentView[] = []
+  const seen = new Set<string>()
+  const walk = (r: AgentRec, depth: number) => {
+    if (seen.has(r.id)) return // a parent link that loops
+    seen.add(r.id)
+    out.push({ id: r.id, type: r.type ?? 'agent', label: r.label, depth, since: r.since })
+    for (const c of (kids.get(r.id) ?? []).sort(byStart)) walk(c, depth + 1)
+  }
+  for (const r of roots.sort(byStart)) walk(r, 0)
+  // Agents left out only by a parent cycle with no root: still shown.
+  for (const r of liveRecs) if (!seen.has(r.id)) walk(r, 0)
+  return out
 }
