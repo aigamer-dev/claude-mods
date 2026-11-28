@@ -87,4 +87,8 @@ Ideas, bug reports and pull requests are welcome.
    claude plugin test mods/<name>
    ```
 
-Only finished, documented extensions are accepted into this repository.
+Only finished, documented extensions are accepted into this repository. `master` is protected: work on a branch (or a fork), open a pull request, and the maintainer merges it.
+
+## Project
+
+[Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Agent guide](AGENTS.md)
