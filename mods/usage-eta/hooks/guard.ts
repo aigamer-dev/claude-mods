@@ -42,6 +42,11 @@ export const DRAIN_MIN = 3
  */
 export const RELEASE_BELOW_PCT = 50
 
+/** The guard never trips below this used percent (it must stay above RELEASE_BELOW_PCT). */
+export const MIN_TRIP_USED = RELEASE_BELOW_PCT + 10
+/** Longest the AAR turn may run before the guard stops waiting for its marker. */
+export const WRITE_MAX_MS = 10 * 60_000
+
 /** True when a fresh 5h reading shows the window that tripped the guard is gone. */
 export const windowFresh = (usedPct: number | undefined): boolean =>
   usedPct !== undefined && usedPct < RELEASE_BELOW_PCT
@@ -51,10 +56,13 @@ export const TRIP_KEY = 'guard:trip'
 /** Set by /eta override: every session keeps the guard off until `until`. */
 export const HOLD_KEY = 'guard:hold'
 /** How long the guard stays off after an AAR turn that wrote no file (no retry loop). */
+/** A guard transition that has not finished after this long no longer blocks the others. */
+export const LOCK_MAX_MS = 30_000
 export const AAR_RETRY_MS = 10 * 60_000
 export const liveKey = (sessionId: string) => `live:${sessionId}`
 
-export type Live = { t: number; threads: number; cwd: string }
+/** `cycle` is the AAR path of the guard cycle this session is in (it survives a /clear). */
+export type Live = { t: number; threads: number; cwd: string; cycle?: string }
 export type Trip = { resetsAt: string; at: number }
 export type Hold = { until: number; at: number }
 
@@ -73,10 +81,13 @@ export function countThreads(live: readonly Live[], now: number, own: number): n
  */
 export function thresholds(threads: number, aarCostPct: number, rate = 0) {
   const reserve = threads * aarCostPct * AAR_SAFETY + 1 + Math.max(0, rate) * DRAIN_MIN
+  // Floors keep the trip point above RELEASE_BELOW_PCT: a trip below it would read as a fresh
+  // window, release at once and trip again on every reading.
+  const used = Math.max(MIN_TRIP_USED, Math.min(TRIGGER_USED, 100 - reserve))
   return {
     reserve,
-    used: Math.min(TRIGGER_USED, 100 - reserve),
-    est: Math.min(TRIGGER_EST, 100 - reserve / 2),
+    used,
+    est: Math.max(used + 3, Math.min(TRIGGER_EST, 100 - reserve / 2)),
   }
 }
 
@@ -120,7 +131,38 @@ const READ_PS = new RegExp(
   String.raw`^\s*(?:${GIT_READ}|Get-ChildItem|Get-Content|Get-Location|Test-Path|Select-String|gci|gc|ls|dir|cat|pwd)\b`,
   'i',
 )
-const SHELL_META = /[;&|><`$]/
+const SHELL_META = /[;&|><`$\r\n{}]/
+/** Anything outside printable ASCII (smart quotes and the like) can hide an option from the checks. */
+const NON_ASCII = /[^\x20-\x7e]/
+/** `git branch` may only list; any other argument can delete or rename a branch. */
+const GIT_BRANCH_ARGS = /^(?:\s+(?:-a|-r|-v|-vv|--all|--remotes|--list|--show-current|--verbose))*\s*$/
+/**
+ * Threat model: this allowlist steers a model that is honest but eager, so it does not start new
+ * work while the 5h limit is nearly spent. It is not a sandbox against a hostile one. The cheap
+ * holes that need no cleverness are shut (below); do not rely on it to contain adversarial input.
+ *
+ * Extra checks for a git command that matched the read-only list: no `-c` (it runs configured
+ * commands), no `--ou...` (`--output` writes a file, and git takes abbreviations), no
+ * `--no-index`, `--ext-diff` or `--textconv` (they run configured programs), no quotes or
+ * backslashes outside the `-C <path>` (they hide options from these checks), a `-C <path>` that
+ * is not inside the AAR folder (a repository the model wrote there could name a hook in its own
+ * config), and `branch` only lists. Case-sensitive on purpose.
+ */
+function gitReadSafe(cmd: string, aarDir: string): boolean {
+  if (!/\bgit\b/i.test(cmd)) return true
+  const c = /(\bgit\s+)-C\s+("[^"]*"|'[^']*'|\S+)/.exec(cmd)
+  if (c) {
+    const target = unquote(c[2] ?? '')
+    // A relative path cannot be placed against the AAR folder here: refuse it (use an absolute one).
+    if (!/^(?:\/|[a-z]:[\\/])/i.test(target)) return false
+    if (aarDir && insideDir(`${target}/x`, aarDir)) return false
+  }
+  const rest = cmd.replace(/(\bgit\s+)-C\s+(?:"[^"]*"|'[^']*'|\S+)/, '$1')
+  if (/(^|\s)-c(\s|=|$)/.test(rest) || /--ou/.test(rest) || /["'\\]/.test(rest)) return false
+  if (/--(?:no-index|ext-diff|textconv)/.test(rest)) return false
+  const m = /\bgit\s+branch\b(.*)$/i.exec(rest)
+  return !m || GIT_BRANCH_ARGS.test(m[1] ?? '')
+}
 
 const unquote = (x: string) => x.replace(/^["']|["']$/g, '')
 
@@ -146,12 +188,24 @@ export function toolAllowed(
   if (READ_TOOLS.has(tool)) return true
   if (phase === 'waiting') return false
   if ((tool === 'Write' || tool === 'Edit') && typeof input.file_path === 'string') {
-    return insideDir(input.file_path, aarDir)
+    // Never into a `.git` folder: a repository planted in the AAR folder could carry a hook in its config.
+    // ...nor a file named HEAD or config: a bare repository needs no `.git` folder.
+    return (
+      insideDir(input.file_path, aarDir) &&
+      !/(^|[\\/])\.git([\\/]|$)/i.test(input.file_path) &&
+      !/(^|[\\/])(?:HEAD|config)$/i.test(input.file_path)
+    )
   }
   if ((tool === 'Bash' || tool === 'PowerShell') && typeof input.command === 'string') {
     const cmd = input.command
     if (isAarMkdir(cmd, aarDir)) return true
-    return (tool === 'Bash' ? READ_BASH : READ_PS).test(cmd) && !SHELL_META.test(cmd)
+    return (
+      (tool === 'Bash' ? READ_BASH : READ_PS).test(cmd) &&
+      !SHELL_META.test(cmd) &&
+      !NON_ASCII.test(cmd) &&
+      !(tool === 'PowerShell' && /[()]/.test(cmd)) &&
+      gitReadSafe(cmd, aarDir)
+    )
   }
   return false
 }
@@ -182,6 +236,8 @@ export type Pending = {
   oldSession: string
   /** Made with /eta pause: resumes only on /eta resume, whatever the 5h window does. */
   manual?: boolean
+  /** The session that holds this pause now: another session adopting it takes the claim, and the old holder steps down. */
+  claimedBy?: string
 }
 
 export const shouldTrigger = (usedPct: number | undefined, pctNeeded: number): boolean =>
@@ -199,8 +255,9 @@ export function planResume(now: number, resetsAt: string | undefined) {
 
 export const stamp = (ms: number) => new Date(ms).toISOString().replace(/[:.]/g, '-').slice(0, 19)
 
-export const aarPath = (cwd: string, ms: number) =>
-  `${cwd.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/aar/${stamp(ms)}/AAR.md`
+/** `tag` (a session id prefix) keeps two sessions that trip in the same second on different AARs. */
+export const aarPath = (cwd: string, ms: number, tag = '') =>
+  `${cwd.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude/aar/${stamp(ms)}${tag ? `-${tag}` : ''}/AAR.md`
 
 export const aarPrompt = (
   path: string,
@@ -227,7 +284,11 @@ export const aarPrompt = (
   'failing tests and open questions; Files and URLs to re-read first. Be dense, no filler. When the file is ' +
   'written reply with one line only: "AAR written" and the path. Do not start any other work.'
 
-export const resumePrompt = (path: string, cleared: boolean, hasCmds = false, manual = false) =>
+export const resumePrompt = (path: string, cleared: boolean, hasCmds = false, manual = false, inline = '') =>
+  (inline
+    ? `${RESUME_MARKER} The held prompts could not be written into the AAR; they are listed here instead and ` +
+      `must be handled first:\n\n${inline}\n\n`
+    : '') +
   `${RESUME_MARKER} ` +
   (manual ? 'The person paused this session and is back now. ' : 'The usage window has reset. ') +
   (cleared ? 'This is a fresh session: you have no memory of the earlier one. ' : '') +
@@ -244,7 +305,9 @@ export const purgeScript =
   'for f in $(find "$HOME/.claude/projects" -name "$1.jsonl" 2>/dev/null); do ' +
   'mv "$f" "$d/" && echo "$(date -Is)\t$f\tsuperseded by AAR resume\t$2" >> "$d/MANIFEST.txt"; done'
 
-export const storeKey = (cwd: string) => `resume:${cwd}`
+/** One saved pause per guard cycle, keyed by the cycle's unique AAR path. */
+export const RESUME_PREFIX = 'resume:'
+export const storeKey = (aar: string) => `${RESUME_PREFIX}${aar}`
 
 export const aarDirOf = (aar: string) => aar.replace(/[\\/][^\\/]*$/, '')
 
@@ -257,7 +320,19 @@ export const PLUGIN_NAME = 'usage-eta'
  * was written); the rest were never run.
  */
 export type Cmd = { t: number; text: string; kind: 'held' | 'bypass' }
-export const cmdsKey = (cwd: string) => `guard:cmds:${cwd}`
+/** Held prompts belong to one guard cycle (its AAR path), so cycles and sessions never mix. */
+export const cmdsKey = (aar: string) => `guard:cmds:${aar}`
+
+/**
+ * True when a saved pause may be picked up by this session: no other live session
+ * is in that cycle (this session's own old heartbeat does not count). The cycle id is the AAR path, which a /clear does not change.
+ */
+export const mayAdopt = (
+  rec: { aar: string; oldSession: string },
+  ownId: string,
+  live: readonly { id: string; t: number; cycle?: string }[],
+  now: number,
+): boolean => !live.some(l => l.id !== ownId && l.cycle === rec.aar && now - l.t <= LIVE_MS)
 
 export const CMD_BEGIN = '<!-- usage-eta:commands -->'
 export const CMD_END = '<!-- /usage-eta:commands -->'
@@ -321,4 +396,37 @@ export function isHeldPrompt(
   const k = e.origin?.kind
   if (k === 'plugin') return false
   return k === undefined || USER_KINDS.has(k)
+}
+
+/** The /eta subcommands the typeahead offers, in the order drawn. A trailing space is kept for one that takes text. */
+const ETA_SUBS = [
+  { text: 'pause', description: 'save an AAR and stay paused until /eta resume' },
+  { text: 'resume', description: 'continue from the saved AAR now' },
+  { text: 'bypass ', label: 'bypass <prompt>', description: 'run one prompt with the limit guard lifted' },
+  { text: 'override', description: 'lift the limit guard for a while' },
+  { text: 'guard on', description: 'turn the limit guard back on after an override' },
+] as const
+/** The word that may follow a two-word subcommand. */
+const ETA_SECOND: Record<string, { text: string; description: string }> = {
+  override: { text: 'off', description: 'turn the limit guard back on' },
+  guard: { text: 'on', description: 'turn the limit guard back on' },
+}
+
+/**
+ * Typeahead rows for `/eta <word>`: the subcommands (and the word after `override` or `guard`).
+ * `text` is the whole draft, `start` where the token at the cursor begins and `token` that token.
+ * Nothing is offered for the prompt after `bypass`, or anywhere but the first word after /eta.
+ */
+export function etaCompletions(text: string, start: number, token: string): { text: string; label?: string; description: string }[] {
+  const before = text.slice(0, start)
+  const word = token.toLowerCase()
+  const second = /^\s*\/eta\s+(override|guard)\s+$/i.exec(before)
+  if (second) {
+    const row = ETA_SECOND[(second[1] ?? '').toLowerCase()]
+    return row && row.text.startsWith(word) ? [row] : []
+  }
+  if (!/^\s*\/eta\s+$/i.test(before)) return []
+  return ETA_SUBS.filter(r => r.text.trim().startsWith(word) || (r.text === 'guard on' && 'guard'.startsWith(word))).map(r =>
+    r.text === 'guard on' ? { text: 'guard ', label: 'guard on', description: r.description } : { ...r },
+  )
 }
