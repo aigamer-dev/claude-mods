@@ -56,3 +56,7 @@ Open an issue for bugs and ideas. For security issues, do not open a public issu
 ## Working with an AI agent
 
 [AGENTS.md](AGENTS.md) (also loaded as `CLAUDE.md`) tells an agent how this repository is laid out and what rules it must follow. Point your agent at it before it makes changes.
+
+## License
+
+By contributing you agree that your contribution is licensed under the [MIT License](LICENSE).

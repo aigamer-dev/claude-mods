@@ -4,6 +4,9 @@ All notable changes to this collection are recorded here. The format follows [Ke
 
 ## [Unreleased]
 
+### Added
+- MIT license.
+
 ## claude-armory
 
 ### 2026-11-28

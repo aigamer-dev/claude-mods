@@ -92,3 +92,7 @@ Only finished, documented extensions are accepted into this repository. `master`
 ## Project
 
 [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Agent guide](AGENTS.md)
+
+## License
+
+[MIT](LICENSE)
