@@ -1,2 +1,15 @@
-# Runtime output of the usage-eta guard (AARs, checkpoints) and local Claude settings
+# Only finished, public-ready code belongs in this repository.
+# Local agent state, memory and settings
 .claude/
+CLAUDE.local.md
+# Secrets and environments (keep .env.example)
+.env
+.env.*
+!.env.example
+# Research, plans, reports and scratch work stay outside the repo
+/reports/
+/research_notes/
+/plans/
+/notes/
+/scratch/
+*.bak-*
