@@ -1,5 +1,5 @@
 {
-  "name": "claude-mods",
+  "name": "claude-armory",
   "owner": { "name": "aigamer-dev" },
   "plugins": [
     { "name": "usage-eta", "source": "./mods/usage-eta", "description": "Usage limits, task tracker with EGM steps, self-calibrating ETA and token estimator." }
