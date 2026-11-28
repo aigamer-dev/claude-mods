@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adds, updates or removes the usage-eta block in a CLAUDE.md, idempotently, with a backup.
+"""Adds, updates or removes the runway block in a CLAUDE.md, idempotently, with a backup.
 
 Usage: setup.py [--file PATH] [--remove] [--dry-run]
 Default file: $CLAUDE_CONFIG_DIR/CLAUDE.md, else ~/.claude/CLAUDE.md. The block sits
@@ -8,15 +8,18 @@ exactly that block out again and nothing else.
 
 It stops with exit code 2 and changes nothing when the markers are not one clean
 pair (a lone, reversed or repeated marker), or when the file already has a
-usage-eta section without markers: pairing them blindly could duplicate the rules
+runway section without markers: pairing them blindly could duplicate the rules
 or delete text the person wrote.
 """
 import argparse, datetime, os, re, shutil, sys, tempfile
 
-BEGIN_PREFIX = "<!-- usage-eta:begin"
-BEGIN = BEGIN_PREFIX + " (managed by the usage-eta plugin; run /usage-eta-setup to update) -->"
-END = "<!-- usage-eta:end -->"
-UNMARKED = re.compile(r"^#{1,6}\s+usage-eta\b", re.IGNORECASE)
+BEGIN_PREFIX = "<!-- runway:begin"
+BEGIN = BEGIN_PREFIX + " (managed by the runway plugin; run /runway-setup to update) -->"
+END = "<!-- runway:end -->"
+# The block written while the plugin was still called usage-eta is recognised and rewritten under the new name.
+LEGACY_BEGIN_PREFIX = "<!-- usage-eta:begin"
+LEGACY_END = "<!-- usage-eta:end -->"
+UNMARKED = re.compile(r"^#{1,6}\s+(?:runway|usage-eta):", re.IGNORECASE)
 
 
 def default_file() -> str:
@@ -26,18 +29,19 @@ def default_file() -> str:
 
 def find_block(lines):
     """(begin, end) line indexes of the one marked block, or None; raises ValueError on a bad marker layout."""
-    begins = [n for n, l in enumerate(lines) if l.strip().startswith(BEGIN_PREFIX)]
-    ends = [n for n, l in enumerate(lines) if l.strip() == END]
+    begins = [n for n, l in enumerate(lines) if l.strip().startswith((BEGIN_PREFIX, LEGACY_BEGIN_PREFIX))]
+    ends = [n for n, l in enumerate(lines) if l.strip() in (END, LEGACY_END)]
     if not begins and not ends:
         if any(UNMARKED.match(l) for l in lines):
             raise ValueError(
-                "the file has a usage-eta section without markers; wrap it in "
+                "the file has a runway section without markers; wrap it in "
                 f"{BEGIN_PREFIX} ... --> and {END} lines (or delete it) and run again"
             )
         return None
     if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
         raise ValueError(
-            f"expected one '{BEGIN_PREFIX}' line followed by one '{END}' line, found "
+            f"expected one '{BEGIN_PREFIX}' (or legacy '{LEGACY_BEGIN_PREFIX}') line followed by one '{END}' "
+            f"(or '{LEGACY_END}') line, found "
             f"{len(begins)} begin and {len(ends)} end marker(s); fix them by hand and run again"
         )
     return begins[0], ends[0]
@@ -74,12 +78,12 @@ def main() -> int:
     try:
         found = find_block(lines)
     except ValueError as err:
-        print(f"usage-eta setup: {a.file}: {err}", file=sys.stderr)
+        print(f"runway setup: {a.file}: {err}", file=sys.stderr)
         return 2
     fresh = [BEGIN, *block.splitlines(), END]
     if a.remove:
         if not found:
-            print("usage-eta block not present in", a.file)
+            print("runway block not present in", a.file)
             return 0
         b, e = found
         if b > 0 and lines[b - 1].strip() == "":
@@ -95,7 +99,7 @@ def main() -> int:
         out = out + ([""] if out else []) + fresh + [""]
     new = nl.join(out)
     if new == text:
-        print("usage-eta block already up to date in", a.file)
+        print("runway block already up to date in", a.file)
         return 0
     if a.dry_run:
         print("would update", a.file)

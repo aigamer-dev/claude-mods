@@ -62,19 +62,19 @@ import type { Model } from './estimator'
 import { abortOrder, live as liveAgents, merge as mergeAgents, newCycle, noteDenied, noteEnd, noteSeen, noteSpawn } from './agents'
 import type { Tree } from './agents'
 
-const PANE = 'usage-eta'
-const tasks = atom({ plugin: 'usage-eta', key: 'tasks' } as const, [], {
+const PANE = 'runway'
+const tasks = atom({ plugin: 'runway', key: 'tasks' } as const, [], {
   shape: 'tasks-1',
 })
-const egm = atom({ plugin: 'usage-eta', key: 'egm' } as const, null, {
+const egm = atom({ plugin: 'runway', key: 'egm' } as const, null, {
   shape: 'egm-2',
 })
-const usage = atom({ plugin: 'usage-eta', key: 'usage' } as const, { tokens: 0, usd: 0 }, {
+const usage = atom({ plugin: 'runway', key: 'usage' } as const, { tokens: 0, usd: 0 }, {
   shape: 'usage-1',
 })
 
 const ETA_RULE = {
-  id: 'usage-eta:eta',
+  id: 'runway:eta',
   scope: 'session',
   text:
     'When you keep a task list (TodoWrite, TaskCreate, or a plan tool), end every item\'s ' +
@@ -823,12 +823,12 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
   const arg = (e.args ?? '').trim().toLowerCase()
   if (arg === 'guard on' || arg === 'override off') {
     await clearHold($)
-    return { text: 'usage-eta: the limit guard is on again' }
+    return { text: 'runway: the limit guard is on again' }
   }
   if (/^bypass\b/.test(arg)) {
     const prompt = e.args.trim().replace(/^bypass\s*/i, '').trim()
     if (!prompt) {
-      return { text: 'usage-eta: usage is /eta bypass <your prompt>: it runs that prompt once with the limit guard lifted' }
+      return { text: 'runway: the syntax is /eta bypass <your prompt>: it runs that prompt once with the limit guard lifted' }
     }
     const now = await $.clock.now()
     if (G.phase !== 'idle') {
@@ -844,8 +844,8 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     return {
       text:
         G.phase === 'idle'
-          ? 'usage-eta: the limit guard is not active; running your prompt normally'
-          : 'usage-eta: running your prompt with the limit guard lifted for this turn only',
+          ? 'runway: the limit guard is not active; running your prompt normally'
+          : 'runway: running your prompt with the limit guard lifted for this turn only',
     }
   }
   if (arg === 'pause') {
@@ -853,15 +853,15 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     // then it stays paused until /eta resume, whatever the 5h window does. Survives a restart.
     const cwd = await $.session.cwd()
     if (G.phase === 'waiting' && G.pending) {
-      if (G.pending.manual) return { text: 'usage-eta: already paused; run /eta resume when you are back' }
+      if (G.pending.manual) return { text: 'runway: already paused; run /eta resume when you are back' }
       G.manual = true
       G.pending = { ...G.pending, manual: true, resumeAt: MANUAL_RESUME_AT }
       await $.store.set(storeKey(G.pending.aar), G.pending)
-      return { text: 'usage-eta: the pause now stays until you run /eta resume (it will not resume at the limit reset)' }
+      return { text: 'runway: the pause now stays until you run /eta resume (it will not resume at the limit reset)' }
     }
     if (G.phase !== 'idle') {
       G.manual = true
-      return { text: 'usage-eta: the AAR is already being saved; the session then stays paused until you run /eta resume' }
+      return { text: 'runway: the AAR is already being saved; the session then stays paused until you run /eta resume' }
     }
     const now = await $.clock.now()
     G.manual = true
@@ -881,7 +881,7 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     await advanceDrainInner($)
     return {
       text:
-        'usage-eta: pausing: running work finishes, then the AAR is written and the session holds. ' +
+        'runway is pausing: running work finishes, then the AAR is written and the session holds. ' +
         'Run /eta resume when you are back (it also survives a restart).',
     }
   }
@@ -893,7 +893,7 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     // Only an idle session looks at other pauses: mid-drain or mid-write there is nothing of its own to resume.
     const found = G.pending ? { rec: G.pending } : G.phase === 'idle' ? await findPause($, cwd) : {}
     if (!found.rec && found.blocked) {
-      return { text: 'usage-eta: the saved pause in this folder belongs to another running session; run /eta resume there' }
+      return { text: 'runway: the saved pause in this folder belongs to another running session; run /eta resume there' }
     }
     const own = found.rec
     const mine = !own && G.aar && (await $.fs.exists(G.aar).catch(() => false)) ? G.aar : undefined
@@ -921,8 +921,8 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
       return {
         text:
           (was === 'idle'
-            ? 'usage-eta: no AAR found for this folder, nothing to resume from'
-            : `usage-eta: the limit guard is released (was ${was}); no AAR was written yet, so there is nothing to resume from`) +
+            ? 'runway: no AAR found for this folder, nothing to resume from'
+            : `runway: the limit guard is released (was ${was}); no AAR was written yet, so there is nothing to resume from`) +
           tail,
       }
     }
@@ -938,7 +938,7 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     G.phase = 'waiting'
     // Submitted from a timer (a prompt cannot be queued from inside a command); checkResume sends it.
     $.clock.after(300, () => void checkResume($).catch(() => undefined))
-    return { text: `usage-eta: resuming from the AAR at ${aar} now (guard reset, the 5h window is read afresh)` }
+    return { text: `runway: resuming from the AAR at ${aar} now (guard reset, the 5h window is read afresh)` }
   }
   if (arg === 'override') {
     const was = G.phase
@@ -953,8 +953,8 @@ async function etaCommand($: EngineInterface, e: { args: string }) {
     await release($, 'overridden with /eta override', false).catch(() => undefined)
     const base =
       was === 'idle'
-        ? 'usage-eta: the limit guard is held off until the 5h window resets (/eta guard on turns it back on)'
-        : `usage-eta: limit guard released (was ${was}); tools are allowed again until the 5h window resets`
+        ? 'runway: the limit guard is held off until the 5h window resets (/eta guard on turns it back on)'
+        : `runway: limit guard released (was ${was}); tools are allowed again until the 5h window resets`
     return {
       text: heldNow ? `${base}\nThese prompts were held and not run, send them again if you want them:\n${heldNow}` : base,
     }

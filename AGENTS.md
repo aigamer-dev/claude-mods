@@ -16,7 +16,7 @@ mods/<name>/
 README.md  CHANGELOG.md  CONTRIBUTING.md  SECURITY.md  AGENTS.md  CLAUDE.md
 ```
 
-Today there is one extension, `usage-eta` (usage limits, ETA and the limit guard).
+Today there is one extension, `runway` (usage limits, ETA and the limit guard).
 
 ## Rules you must follow
 
@@ -30,8 +30,8 @@ Today there is one extension, `usage-eta` (usage limits, ETA and the limit guard
 ## Commands
 
 ```bash
-claude plugin test mods/usage-eta                          # plugin tests
-python3 mods/usage-eta/skills/usage-eta-setup/test_setup.py  # setup script tests
+claude plugin test mods/runway                          # plugin tests
+python3 mods/runway/skills/runway-setup/test_setup.py  # setup script tests
 ```
 
 Run the tests for any extension you touch, and make them pass before you open a pull request.
@@ -42,7 +42,7 @@ Run the tests for any extension you touch, and make them pass before you open a 
 2. Keep pure logic in its own module (for example `guard.ts`, `agents.ts`, `estimator.ts`) and the hook wiring in `register.tsx`, so the logic is unit tested without the engine.
 3. Add or update a test for every behavior you change. Prefer a test that fails without your change.
 4. Update the extension's `README.md`, bump its version in `plugin.json`, and add an entry to `CHANGELOG.md`.
-5. Commit with a summary that starts with the extension, for example `usage-eta 0.2.1: fix the resume check`, and a body that says why.
+5. Commit with a summary that starts with the extension, for example `runway 0.2.1: fix the resume check`, and a body that says why.
 6. Open a pull request against `master` and describe what changed, why, and how you tested it.
 
 ## Adding a new extension
@@ -58,4 +58,4 @@ Follow [CONTRIBUTING.md](CONTRIBUTING.md): create `mods/<name>/` with a `plugin.
 
 ## Building on top of this repository
 
-To build your own extension with an agent, point it at this file and at the closest existing extension (`mods/usage-eta`) as a pattern, then follow "Adding a new extension". The agent should read `CONTRIBUTING.md` and `SECURITY.md` first.
+To build your own extension with an agent, point it at this file and at the closest existing extension (`mods/runway`) as a pattern, then follow "Adding a new extension". The agent should read `CONTRIBUTING.md` and `SECURITY.md` first.

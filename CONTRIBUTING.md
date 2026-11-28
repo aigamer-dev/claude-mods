@@ -46,7 +46,7 @@ Only finished, documented, tested code. The repository is public and many people
 ## Commits and pull requests
 
 - One topic per pull request. Keep the diff small and readable.
-- Commit messages: a short summary line, starting with the extension, for example `usage-eta 0.2.1: fix the resume check`. Add a body that explains why.
+- Commit messages: a short summary line, starting with the extension, for example `runway 0.2.1: fix the resume check`. Add a body that explains why.
 - In the pull request, say what changed, why, and how you tested it.
 
 ## Reporting bugs and security issues

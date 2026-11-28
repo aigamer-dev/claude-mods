@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { CMD_BEGIN, DRAIN_MAX_MS, MARKER, etaCompletions, MIN_TRIP_USED, RELEASE_BELOW_PCT, RESUME_MARKER, aarPath, mayAdopt, thresholds, toolAllowed } from './guard'
+import { withCommands, CMD_BEGIN, DRAIN_MAX_MS, MARKER, etaCompletions, MIN_TRIP_USED, RELEASE_BELOW_PCT, RESUME_MARKER, aarPath, mayAdopt, thresholds, toolAllowed } from './guard'
 
 const T0 = 1_700_000_000_000
 const MIN = 60_000
@@ -411,7 +411,7 @@ test('/eta bypass runs one prompt with the guard lifted, then the guard is back'
   const denied: any = await $.tool.call({ tool: 'Bash', command: 'npm test' })
   expect(denied.deny).toContain('paused')
   const none: any = await $.command.run({ command: 'eta', args: 'bypass' })
-  expect(none.text).toContain('usage is')
+  expect(none.text).toContain('the syntax is')
   const r: any = await $.command.run({ command: 'eta', args: 'bypass fix the build' })
   expect(r.text).toContain('lifted')
   await clock.advance(1000)
@@ -1023,4 +1023,13 @@ test('review 5: a store error at the resume check is retried, not taken for anot
   state.failKey = ''
   await clock.advance(MIN)
   expect(seen.submits.filter(t => t.includes(RESUME_MARKER))).toHaveLength(1) // retried and resumed
+})
+
+test('rename: an AAR written under the old name keeps one commands block after a flush', () => {
+  const oldBlock = '<!-- usage-eta:commands -->\nold\n<!-- /usage-eta:commands -->\n\n# AAR\nbody\n'
+  const out = withCommands(oldBlock, [{ t: T0, text: 'do the thing', kind: 'held' } as any])
+  expect(out.startsWith(CMD_BEGIN)).toBe(true)
+  expect(out).not.toContain('usage-eta')
+  expect(out).toContain('# AAR\nbody')
+  expect(withCommands(out, [{ t: T0, text: 'again', kind: 'held' } as any]).split(CMD_BEGIN).length).toBe(2)
 })

@@ -3,9 +3,9 @@ import { expect, test } from 'claude-code/testing'
 import { agentMinOf, applyTool, blank, correction, forecast, learnAgent, learnTask, learnTurn, splitEta, syncTodos } from './estimator'
 
 const PANE = {
-  plugin: 'usage-eta',
+  plugin: 'runway',
   component: 'Pane',
-  requestId: 'usage-eta',
+  requestId: 'runway',
   props: {
     title: 'Usage & ETA',
     isFocused: false,

@@ -16,8 +16,8 @@ Include what you found, the extension and version, steps to reproduce, and the i
 
 Extensions here run inside Claude Code with your user's permissions. Hooks can read and change files and run commands, so install only what you have read or trust.
 
-- **The usage-eta command allowlist is not a sandbox.** While its limit guard is active it restricts a model to read-only commands so that it stops starting new work. That steers an honest model; it is not a security boundary against hostile input. Reports that show a way around it are welcome, and are treated as hardening unless they cross a real boundary.
-- **Files outside the project.** `/usage-eta-setup` edits only the marked block in `~/.claude/CLAUDE.md`, makes a dated backup first, and refuses to change a file whose markers are not one clean pair.
+- **The runway command allowlist is not a sandbox.** While its limit guard is active it restricts a model to read-only commands so that it stops starting new work. That steers an honest model; it is not a security boundary against hostile input. Reports that show a way around it are welcome, and are treated as hardening unless they cross a real boundary.
+- **Files outside the project.** `/runway-setup` edits only the marked block in `~/.claude/CLAUDE.md`, makes a dated backup first, and refuses to change a file whose markers are not one clean pair.
 - **No secrets.** The extensions do not need API keys or tokens. Never commit credentials to this repository.
 
 ## Scope

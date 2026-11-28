@@ -10,10 +10,19 @@ All notable changes to this collection are recorded here. The format follows [Ke
 ## claude-armory
 
 ### 2026-11-28
-- The collection is now called **claude-armory** (it was `claude-mods`). The marketplace id is `claude-armory`, so install with `usage-eta@claude-armory`.
+- The collection is now called **claude-armory** (it was `claude-mods`). The marketplace id is `claude-armory`, so the plugin was installed with `usage-eta@claude-armory` (now `runway@claude-armory`).
 - Product-style README, a guide for usage-eta, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, and `AGENTS.md` / `CLAUDE.md` for people who build with agents.
 
-## usage-eta
+## runway (formerly usage-eta)
+
+### [0.3.0] - 2026-11-28
+#### Changed
+- **usage-eta is now called runway.** Install it with `runway@claude-armory`; the setup skill is `/runway-setup`. The `/eta` command is unchanged.
+- Upgrading from usage-eta: uninstall `usage-eta`, install `runway`. The estimator learns again from scratch (a few samples are enough), and a pause saved by the old version is not carried over unless you copy the old plugin store file.
+- `/runway-setup` recognises the block written under the old name and rewrites it under the new one, leaving the rest of your `CLAUDE.md` untouched. An AAR that has a command block written by the old version is read and rewritten correctly.
+- The markers the guard puts in its own prompts are now `[runway:aar]` and `[runway:resume]`.
+
+### Earlier versions (published as usage-eta)
 
 ### [0.2.0] - 2026-11-28
 #### Added

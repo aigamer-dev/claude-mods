@@ -17,8 +17,8 @@ export const RESUME_SLACK_MS = 60_000
 /** resumeAt of a pause made with /eta pause: no timer ends it, only /eta resume. */
 export const MANUAL_RESUME_AT = Number.MAX_SAFE_INTEGER
 
-export const MARKER = '[usage-eta:aar]'
-export const RESUME_MARKER = '[usage-eta:resume]'
+export const MARKER = '[runway:aar]'
+export const RESUME_MARKER = '[runway:resume]'
 
 /**
  * idle -> draining (no new work starts, running calls and agents finish and
@@ -312,7 +312,7 @@ export const storeKey = (aar: string) => `${RESUME_PREFIX}${aar}`
 export const aarDirOf = (aar: string) => aar.replace(/[\\/][^\\/]*$/, '')
 
 /** The mod's own name, as it shows in a prompt's origin when the mod submits one. */
-export const PLUGIN_NAME = 'usage-eta'
+export const PLUGIN_NAME = 'runway'
 
 /**
  * A prompt the guard holds back: what the user typed after the guard tripped.
@@ -334,8 +334,8 @@ export const mayAdopt = (
   now: number,
 ): boolean => !live.some(l => l.id !== ownId && l.cycle === rec.aar && now - l.t <= LIVE_MS)
 
-export const CMD_BEGIN = '<!-- usage-eta:commands -->'
-export const CMD_END = '<!-- /usage-eta:commands -->'
+export const CMD_BEGIN = '<!-- runway:commands -->'
+export const CMD_END = '<!-- /runway:commands -->'
 
 /** A held prompt as one blockquoted list item, whatever lines it has. */
 const quote = (text: string) =>
@@ -365,7 +365,7 @@ export function commandsBlock(cmds: readonly Cmd[]): string {
     `${CMD_BEGIN}\n` +
     `# USER COMMANDS RECEIVED AFTER THE USAGE GUARD TRIPPED: ADDRESS FIRST\n\n` +
     `${held} command(s) were held and never run; the user typed them verbatim while the 5h limit guard was ` +
-    'active. Saved by the usage-eta mod, not written by the previous session. Before the plan below, read ' +
+    'active. Saved by the runway mod, not written by the previous session. Before the plan below, read ' +
     'each one, reason about how it changes, adds to or reorders the "Next steps", say so in your first ' +
     'reply, then carry them out.\n\n' +
     `${items}\n` +
@@ -373,12 +373,20 @@ export function commandsBlock(cmds: readonly Cmd[]): string {
   )
 }
 
+/** The command-block markers written while this mod was still called usage-eta: an AAR may carry them. */
+const LEGACY_CMD_BEGIN = '<!-- usage-eta:commands -->'
+const LEGACY_CMD_END = '<!-- /usage-eta:commands -->'
+
+const stripBlock = (text: string, begin: string, end: string) => {
+  const a = text.indexOf(begin)
+  const b = text.indexOf(end)
+  return a >= 0 && b > a ? text.slice(0, a) + text.slice(b + end.length).replace(/^\s*\n/, '') : text
+}
+
 /** The AAR text with the commands block on top (an earlier block replaced); unchanged for none. */
 export function withCommands(aar: string, cmds: readonly Cmd[]): string {
   if (cmds.length === 0) return aar
-  const a = aar.indexOf(CMD_BEGIN)
-  const b = aar.indexOf(CMD_END)
-  const rest = a >= 0 && b > a ? aar.slice(0, a) + aar.slice(b + CMD_END.length).replace(/^\s*\n/, '') : aar
+  const rest = stripBlock(stripBlock(aar, CMD_BEGIN, CMD_END), LEGACY_CMD_BEGIN, LEGACY_CMD_END)
   return commandsBlock(cmds) + rest
 }
 

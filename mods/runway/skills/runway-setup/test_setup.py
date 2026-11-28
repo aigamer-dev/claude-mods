@@ -1,10 +1,10 @@
-"""Tests for setup.py: python3 -m unittest mods/usage-eta/skills/usage-eta-setup/test_setup.py"""
+"""Tests for setup.py: python3 -m unittest mods/runway/skills/runway-setup/test_setup.py"""
 import os, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETUP = os.path.join(HERE, "setup.py")
-BEGIN = "<!-- usage-eta:begin (managed by the usage-eta plugin; run /usage-eta-setup to update) -->"
-END = "<!-- usage-eta:end -->"
+BEGIN = "<!-- runway:begin (managed by the runway plugin; run /runway-setup to update) -->"
+END = "<!-- runway:end -->"
 
 
 def run(path, *args):
@@ -61,20 +61,34 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(self.get(), text)
 
     def test_an_unmarked_usage_eta_section_is_not_duplicated(self):
-        text = "## usage-eta: task tracking\nold rules\n"
+        text = "## runway: task tracking\nold rules\n"
         self.put(text)
         self.assertEqual(run(self.path).returncode, 2)
         self.assertEqual(self.get(), text)
 
     def test_a_reworded_begin_line_is_still_found(self):
-        self.put(f"a\n<!-- usage-eta:begin old wording -->\nold\n{END}\nz\n")
+        self.put(f"a\n<!-- runway:begin old wording -->\nold\n{END}\nz\n")
         self.assertEqual(run(self.path).returncode, 0)
         out = self.get()
-        self.assertEqual(out.count("usage-eta:begin"), 1)
+        self.assertEqual(out.count("runway:begin"), 1)
         self.assertIn(BEGIN, out)
         self.assertNotIn("old wording", out)
         self.assertTrue(out.startswith("a\n"))
         self.assertTrue(out.endswith("z\n"))
+
+    def test_a_block_written_under_the_old_name_is_rewritten_once(self):
+        old_begin = "<!-- usage-eta:begin (managed by the usage-eta plugin; run /usage-eta-setup to update) -->"
+        self.put(f"top\n\n{old_begin}\nold rules\n<!-- usage-eta:end -->\n\nbottom\n")
+        self.assertEqual(run(self.path).returncode, 0)
+        out = self.get()
+        self.assertEqual(out.count(BEGIN), 1)
+        self.assertNotIn("usage-eta:", out)
+        self.assertNotIn("old rules", out)
+        self.assertTrue(out.startswith("top\n\n" + BEGIN))
+        self.assertTrue(out.endswith(END + "\n\nbottom\n"))
+        self.assertIn("already up to date", run(self.path).stdout)
+        run(self.path, "--remove")
+        self.assertEqual(self.get(), "top\n\nbottom\n")
 
     def test_text_outside_the_block_is_untouched_by_update_and_remove(self):
         self.put(f"top\n\n{BEGIN}\nstale\n{END}\n\nbottom\n")

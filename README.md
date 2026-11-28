@@ -14,7 +14,7 @@ claude-armory is a collection of small, focused extensions for [Claude Code](htt
 
 | Extension | Type | What it gives you |
 |---|---|---|
-| [**usage-eta**](mods/usage-eta) | Mod, skill, hooks | See your 5-hour and weekly limits live, get a self-calibrating ETA for your tasks, and let a limit guard pause and resume your work safely when the window runs out |
+| [**runway**](mods/runway) | Mod, skill, hooks | See your 5-hour and weekly limits live, get a self-calibrating ETA for your tasks, and let a limit guard pause and resume your work safely when the window runs out |
 
 More extensions are added over time. Each lives in its own folder under [`mods/`](mods).
 
@@ -29,7 +29,7 @@ More extensions are added over time. Each lives in its own folder under [`mods/`
 2. Install what you want:
 
    ```bash
-   claude plugin install usage-eta@claude-armory
+   claude plugin install runway@claude-armory
    ```
 
 3. Restart Claude Code so it loads the new extension.
@@ -41,9 +41,9 @@ git clone https://github.com/aigamer-dev/claude-armory.git
 claude plugin marketplace add ./claude-armory
 ```
 
-## Featured: usage-eta
+## Featured: runway
 
-Know before you run out. usage-eta puts your usage limits, your task list and a forecast side by side, and learns how long your work really takes.
+Know before you run out. runway puts your usage limits, your task list and a forecast side by side, and learns how long your work really takes.
 
 - **Live limits and forecast.** The 5-hour and weekly limits, a task tracker (including [EGM](https://github.com/google/elephant-goldfish-model) subagent steps), and an ETA with a token estimate and a "fits in the 5-hour window" verdict.
 - **Learns from you.** The estimator calibrates itself from finished tasks, turns and agent runs, so its estimates get closer to your real pace.
@@ -51,7 +51,7 @@ Know before you run out. usage-eta puts your usage limits, your task list and a 
 - **Works at any depth.** The guard follows every agent however deeply they nest, refuses new ones while it is active, and stops the ones that ignore the checkpoint request.
 - **Easy control.** `/eta` with autocomplete for `pause`, `resume`, `bypass`, `override` and `guard on`.
 
-Full guide: [mods/usage-eta](mods/usage-eta/README.md).
+Full guide: [mods/runway](mods/runway/README.md).
 
 ## How it fits together
 

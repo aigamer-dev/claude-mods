@@ -39,7 +39,7 @@ export type Usage = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-eta': {
+    'runway': {
       tasks: Shaped<Task[]>
       egm: Shaped<EgmRun | null>
       usage: Shaped<Usage>

@@ -1,6 +1,6 @@
-# usage-eta
+# runway
 
-**Know before you run out.** usage-eta shows your Claude Code usage limits, tracks your tasks, forecasts how long they will take, and pauses and resumes your work safely when the 5-hour window runs out.
+**Know before you run out.** runway shows your Claude Code usage limits, tracks your tasks, forecasts how long they will take, and pauses and resumes your work safely when the 5-hour window runs out.
 
 ## Contents
 
@@ -28,10 +28,10 @@
 
 ```bash
 claude plugin marketplace add aigamer-dev/claude-armory
-claude plugin install usage-eta@claude-armory
+claude plugin install runway@claude-armory
 ```
 
-Restart Claude Code. Then run `/usage-eta-setup` once (see [Setup for your agents](#setup-for-your-agents)).
+Restart Claude Code. Then run `/runway-setup` once (see [Setup for your agents](#setup-for-your-agents)).
 
 ## Commands
 
@@ -45,7 +45,7 @@ Type `/eta ` and the typeahead offers the subcommands.
 | `/eta bypass <prompt>` | Runs one prompt with the guard lifted for that turn only. |
 | `/eta override` | Lifts the guard in every session until the 5-hour window resets. |
 | `/eta guard on` | Turns the guard back on after an override. |
-| `/usage-eta-setup` | Adds the agent-coordination rules to your `~/.claude/CLAUDE.md` (see below). |
+| `/runway-setup` | Adds the agent-coordination rules to your `~/.claude/CLAUDE.md` (see below). |
 
 ## The limit guard
 
@@ -76,22 +76,22 @@ Claude Code has no per-agent stop call, so a stop is a refused tool call or an a
 
 ## Setup for your agents
 
-Run `/usage-eta-setup` once, and again after updates. It adds one marked block to `~/.claude/CLAUDE.md` so that every agent estimates its tasks, names its subagent types and reports to the estimator. The estimator can only learn from data your agents give it.
+Run `/runway-setup` once, and again after updates. It adds one marked block to `~/.claude/CLAUDE.md` so that every agent estimates its tasks, names its subagent types and reports to the estimator. The estimator can only learn from data your agents give it.
 
-- The block sits between `usage-eta:begin` and `usage-eta:end` marker lines, so a second run replaces it in place.
+- The block sits between `runway:begin` and `runway:end` marker lines, so a second run replaces it in place.
 - A dated backup is made before every change, and the write is atomic.
 - It refuses to touch a file whose markers are lone, reversed or repeated, so it never deletes your text.
 - To undo it:
 
   ```bash
-  python3 skills/usage-eta-setup/setup.py --remove
+  python3 "${CLAUDE_PLUGIN_ROOT}/skills/runway-setup/setup.py" --remove
   ```
 
 ## Development
 
 ```bash
-claude plugin test mods/usage-eta
-python3 mods/usage-eta/skills/usage-eta-setup/test_setup.py
+claude plugin test mods/runway
+python3 mods/runway/skills/runway-setup/test_setup.py
 ```
 
 | File | Role |
@@ -100,4 +100,4 @@ python3 mods/usage-eta/skills/usage-eta-setup/test_setup.py
 | `hooks/guard.ts` | Pure guard logic: thresholds, the read-only allowlist, AAR paths, completions |
 | `hooks/agents.ts` | The agent tree used to track and stop agents at any depth |
 | `hooks/estimator.ts` | The self-calibrating estimator |
-| `skills/usage-eta-setup/` | The `/usage-eta-setup` skill and its script |
+| `skills/runway-setup/` | The `/runway-setup` skill and its script |
